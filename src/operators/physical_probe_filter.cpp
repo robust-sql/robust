@@ -171,7 +171,8 @@ OperatorResultType PhysicalProbeFilter::ExecuteInternal(ExecutionContext &contex
 		// }
 
 		// lookup directly into selection vector
-		result_count = bf->LookupSel(input, sel, {bound_column_indices[i]}, state.bit_vector.data());
+		SelectionVector newSel = SelectionVector(input.size());
+		result_count = bf->LookupSel(input, newSel, {bound_column_indices[i]}, state.bit_vector.data());
 
 		// early exit if no rows passed
 		if (result_count == 0) {
@@ -185,7 +186,7 @@ OperatorResultType PhysicalProbeFilter::ExecuteInternal(ExecutionContext &contex
 
 		// apply filter if we filtered rows
 		if (result_count < row_num) {
-			input.Slice(sel, result_count);
+			input.Slice(newSel, result_count);
 			row_num = result_count;
 		}
 	}
