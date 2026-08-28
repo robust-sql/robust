@@ -12,15 +12,14 @@ class PhysicalCreateFilter;
 
 class PhysicalProbeFilterState : public CachingOperatorState {
 public:
-	PhysicalProbeFilterState()
-	    : bloom_filters_initialized(false), sel(STANDARD_VECTOR_SIZE), bit_vector((STANDARD_VECTOR_SIZE + 7) / 8) {
+	PhysicalProbeFilterState() : bloom_filters_initialized(false), bit_vector((STANDARD_VECTOR_SIZE + 7) / 8) {
 	}
 
 	vector<shared_ptr<PTBloomFilter>> bloom_filters;
 	bool bloom_filters_initialized;
 
 	// reusable buffers to avoid per-chunk heap allocations
-	SelectionVector sel;
+	vector<SelectionVector> sel_vector;
 	vector<uint8_t> bit_vector;
 };
 

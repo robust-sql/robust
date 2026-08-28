@@ -104,6 +104,7 @@ OperatorResultType PhysicalProbeFilter::ExecuteInternal(ExecutionContext &contex
 						         (unsigned long long)build_col.table_index, (unsigned long long)build_col.column_index,
 						         build_table.c_str());
 						state.bloom_filters.push_back(bf);
+						state.sel_vector.emplace_back(STANDARD_VECTOR_SIZE);
 						break; // found the filter for this column
 					}
 				}
@@ -131,7 +132,6 @@ OperatorResultType PhysicalProbeFilter::ExecuteInternal(ExecutionContext &contex
 
 	// apply bloom filters
 	idx_t result_count = row_num;
-	auto &sel = state.sel;
 
 	unique_ptr<ScopedTimer> probe_timer;
 	if (profiling_stats) {
@@ -171,8 +171,8 @@ OperatorResultType PhysicalProbeFilter::ExecuteInternal(ExecutionContext &contex
 		// }
 
 		// lookup directly into selection vector
-		SelectionVector newSel = SelectionVector(input.size());
-		result_count = bf->LookupSel(input, newSel, {bound_column_indices[i]}, state.bit_vector.data());
+
+		result_count = bf->LookupSel(input, state.sel_vector[i], {bound_column_indices[i]}, state.bit_vector.data());
 
 		// early exit if no rows passed
 		if (result_count == 0) {
@@ -186,7 +186,7 @@ OperatorResultType PhysicalProbeFilter::ExecuteInternal(ExecutionContext &contex
 
 		// apply filter if we filtered rows
 		if (result_count < row_num) {
-			input.Slice(newSel, result_count);
+			input.Slice(state.sel_vector[i], result_count);
 			row_num = result_count;
 		}
 	}
@@ -194,12 +194,7 @@ OperatorResultType PhysicalProbeFilter::ExecuteInternal(ExecutionContext &contex
 	// stop probe timer before output work
 	probe_timer.reset();
 
-	// optimization: if all rows passed, just reference input (zero-copy)
-	if (result_count == row_num) {
-		chunk.Reference(input);
-	} else {
-		chunk.Slice(input, sel, result_count);
-	}
+	chunk.Reference(input);
 
 	if (profiling_stats) {
 		profiling_stats->rows_in.fetch_add(original_row_num, std::memory_order_relaxed);
