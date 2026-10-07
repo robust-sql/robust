@@ -56,4 +56,9 @@ public:
 	bool is_forward_pass = false;
 };
 
+struct FilterOpPair {
+	FilterOperation create_op;
+	FilterOperation probe_op;
+};
+
 } // namespace duckdb

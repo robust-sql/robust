@@ -7,6 +7,7 @@
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/common/types/hyperloglog.hpp"
 
 namespace duckdb {
 
@@ -71,6 +72,10 @@ public:
 
 	unordered_map<ColumnBinding, ColumnBinding, ColumnBindingHashFunction> rename_col_bindings;
 
+	unordered_set<idx_t> table_with_filters;
+
+	bool exist_cycle = false;
+
 public:
 	// extract all the join edges from the plan
 	// vector<JoinEdge> ExtractOperators(LogicalOperator &plan, vector<LogicalOperator*> &join_ops);
@@ -101,7 +106,8 @@ public:
 
 	std::pair<unordered_map<LogicalOperator *, vector<FilterOperation>>,
 	          unordered_map<LogicalOperator *, vector<FilterOperation>>>
-	GenerateStageModificationsFromDAG(vector<PhysicalDAGNode *> &all_nodes, map<ColKey, ColKey> &uf_parent);
+	GenerateStageModificationsFromDAG(vector<PhysicalDAGNode *> &all_nodes, map<ColKey, ColKey> &uf_paren,
+	                                  vector<FilterOpPair> &filter_pairs);
 
 	unique_ptr<LogicalOperator> BuildStackedBFOperators(unique_ptr<LogicalOperator> base_plan,
 	                                                    const vector<FilterOperation> &filter_ops,
@@ -123,6 +129,24 @@ public:
 
 	// pass 2: lift BF operator block above FILTER (handles all FILTER cases)
 	void LiftCreateFilterAboveFilter(unique_ptr<LogicalOperator> &plan);
+
+	unique_ptr<BaseStatistics> GetColumnStatistics(const ColumnBinding &binding);
+
+	idx_t GetBaseTableRowCount(const ColumnBinding &binding);
+
+	unique_ptr<HyperLogLog> GetColumnHLL(const ColumnBinding &binding);
+
+	bool HLLDominates(const ColumnBinding &build_binding, const ColumnBinding &probe_binding);
+
+	void TightenWithLocalPredicate(const ColumnBinding &binding, BaseStatistics &stats);
+
+	bool HasFilteringLocalPredicate(const FilterOpPair &pair);
+
+	bool IsRedundant(const FilterOpPair &pair);
+
+	void RemoveRedundantPairs(vector<FilterOpPair> &filter_pairs,
+	                          unordered_map<LogicalOperator *, vector<FilterOperation>> &forward_filter_ops,
+	                          unordered_map<LogicalOperator *, vector<FilterOperation>> &backward_filter_ops);
 
 	// resolve column binding through rename chain to get base table binding
 	ColumnBinding ResolveColumnBinding(const ColumnBinding &binding) const;
