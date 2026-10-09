@@ -1665,6 +1665,38 @@ static LogicalOperator *FindDeepestCreateFilter(LogicalOperator *node) {
 	return deepest;
 }
 
+// find the deepest CREATE/PROBE FILTER chain starting with a CREATE_FILTER
+static pair<LogicalOperator *, LogicalOperator *> FindDeepestFilterChain(LogicalOperator *node) {
+	LogicalOperator *deepest = nullptr;
+	LogicalOperator *parent = nullptr;
+	LogicalOperator *create = nullptr;
+	while (node) {
+		if (node->children.size() != 1 || node->children[0]->type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
+		    node->children[0]->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+			break;
+		}
+		if (node->children[0]->type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR) {
+			deepest = node;
+			node = node->children[0].get();
+			while (node->type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR) {
+				if (node->children.size() != 1 || node->children[0]->type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
+				    node->children[0]->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+					break;
+				}
+				if (node->type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR &&
+				    dynamic_cast<LogicalCreateFilter *>(node)) {
+					parent = deepest;
+					create = node;
+				}
+				node = node->children[0].get();
+			}
+			return {parent, create};
+		}
+		node = node->children[0].get();
+	}
+	return {parent, create};
+}
+
 void RobustOptimizerContextState::LiftCreateFilterAboveMarkJoin(unique_ptr<LogicalOperator> &plan) {
 	if (!plan) {
 		return;
@@ -1710,19 +1742,43 @@ void RobustOptimizerContextState::LiftCreateFilterAboveFilter(unique_ptr<Logical
 		return;
 	}
 
-	auto *deepest = FindDeepestCreateFilter(plan->children[0].get());
-	if (!deepest) {
+	auto p = FindDeepestFilterChain(plan.get());
+	LogicalOperator *parent = p.first;
+	LogicalOperator *create = p.second;
+	if (!parent || !create) {
 		return;
 	}
 
-	// same block-detach logic as LiftCreateFilterAboveMarkJoin
-	auto below_deepest = std::move(deepest->children[0]);
-	deepest->children.clear();
-	auto block = std::move(plan->children[0]);
-	plan->children[0] = std::move(below_deepest);
-
-	deepest->AddChild(std::move(plan));
-	plan = std::move(block);
+	// lift the CREATE/PROBE FILTER chain above LOGICAL_FILTER and remap the column bindings
+	auto beginning = std::move(parent->children[0]);
+	parent->children[0] = std::move(create->children[0]);
+	create->children[0] = (std::move(plan));
+	plan = std::move(beginning);
+	LogicalOperator *cur = plan.get();
+	while (cur->type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR) {
+		if (auto *createCur = dynamic_cast<LogicalCreateFilter *>(cur)) {
+			auto &filter = createCur->filter_operation;
+			createCur->input_bindings.clear();
+			for (auto &baseBinding : filter.build_columns) {
+				for (auto &binding : createCur->GetColumnBindings()) {
+					if (ResolveColumnBinding(binding) == ResolveColumnBinding(baseBinding)) {
+						createCur->input_bindings.push_back(binding);
+					}
+				}
+			}
+		} else if (auto *probeCur = dynamic_cast<LogicalProbeFilter *>(cur)) {
+			auto &filter = probeCur->filter_operation;
+			probeCur->input_bindings.clear();
+			for (auto &baseBinding : filter.probe_columns) {
+				for (auto &binding : probeCur->GetColumnBindings()) {
+					if (ResolveColumnBinding(binding) == ResolveColumnBinding(baseBinding)) {
+						probeCur->input_bindings.push_back(binding);
+					}
+				}
+			}
+		}
+		cur = cur->children[0].get();
+	}
 }
 
 unique_ptr<LogicalOperator> RobustOptimizerContextState::PreOptimize(unique_ptr<LogicalOperator> plan) {

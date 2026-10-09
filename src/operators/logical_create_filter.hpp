@@ -28,6 +28,7 @@ public:
 
 	bool can_stop = false;
 	FilterOperation filter_operation;
+	vector<ColumnBinding> input_bindings;
 	PhysicalCreateFilter *physical = nullptr;
 
 	vector<LogicalProbeFilter *> related_probe_filter;

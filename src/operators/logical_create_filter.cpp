@@ -15,7 +15,7 @@ LogicalCreateFilter::LogicalCreateFilter() : LogicalExtensionOperator() {
 }
 
 LogicalCreateFilter::LogicalCreateFilter(const FilterOperation &filter_op)
-    : LogicalExtensionOperator(), filter_operation(filter_op) {
+    : LogicalExtensionOperator(), filter_operation(filter_op), input_bindings(filter_op.build_columns) {
 	this->type = LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR;
 	message = "CREATE_FILTER";
 }
@@ -82,7 +82,7 @@ PhysicalOperator &LogicalCreateFilter::CreatePlan(ClientContext &context, Physic
 		// built.
 		// TODO: optimize: Use a map for filter_operation.build_columns to speed up lookup
 		vector<idx_t> resolved_indices;
-		for (const ColumnBinding &column_binding : filter_operation.build_columns) {
+		for (const ColumnBinding &column_binding : input_bindings) {
 			// find the position of the filter column ColumnBinding in the chunk columns
 			for (idx_t i = 0; i < child_bindings.size(); i++) {
 				if (child_bindings[i].table_index == column_binding.table_index &&

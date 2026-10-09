@@ -9,7 +9,7 @@ LogicalProbeFilter::LogicalProbeFilter() : LogicalExtensionOperator() {
 }
 
 LogicalProbeFilter::LogicalProbeFilter(const FilterOperation &filter_op)
-    : LogicalExtensionOperator(), filter_operation(filter_op) {
+    : LogicalExtensionOperator(), filter_operation(filter_op), input_bindings(filter_op.probe_columns) {
 	this->type = LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR;
 }
 
@@ -67,7 +67,7 @@ PhysicalOperator &LogicalProbeFilter::CreatePlan(ClientContext &context, Physica
 		}
 #endif
 
-		for (const ColumnBinding &column_binding : filter_operation.probe_columns) {
+		for (const ColumnBinding &column_binding : input_bindings) {
 			D_PRINTF("[RESOLVE] Looking for probe_column: table_idx=%llu, col_idx=%llu",
 			         (unsigned long long)column_binding.table_index, (unsigned long long)column_binding.column_index);
 			// find the position of the filter column ColumnBinding in the chunk columns

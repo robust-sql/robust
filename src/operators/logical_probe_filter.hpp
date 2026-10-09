@@ -28,6 +28,7 @@ public:
 	FilterOperation filter_operation;
 	LogicalCreateFilter *related_create_filter = nullptr;
 	bool is_passthrough = false;
+	vector<ColumnBinding> input_bindings;
 
 	PhysicalProbeFilter *physical = nullptr;
 
