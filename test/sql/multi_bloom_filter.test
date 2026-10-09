@@ -1,0 +1,65 @@
+# name: test/sql/multi_bloom_filter.test
+# group: [sql]
+
+# regression test for a single PROBE_FILTER carrying more than one bloom filter.
+# all filters used to share one selection vector; input.Slice() keeps a reference
+# to that buffer, so the next lookup overwrote the mapping the previous slice
+# depended on and the operator emitted wrong rows.
+
+statement ok
+LOAD 'build/release/extension/robust/robust.duckdb_extension';
+
+statement ok
+SET disabled_optimizers = 'join_filter_pushdown';
+
+# the two-column a<->b join is what gives one PROBE_FILTER two bloom filters.
+# c keeps the transfer graph above the single-edge bail-out, and both join
+# columns stay selective so each filter actually slices the chunk.
+statement ok
+CREATE TABLE a AS SELECT i AS x, i%11 AS y, i AS va FROM range(10000) t(i);
+
+statement ok
+CREATE TABLE b AS SELECT i%50 AS x, i%4 AS y, i AS vb FROM range(5000) t(i);
+
+statement ok
+CREATE TABLE c AS SELECT i AS x, i AS vc FROM range(40) t(i);
+
+foreach flip_roots true false
+
+statement ok
+SET robust_flip_roots = ${flip_roots};
+
+foreach pass_mode both forward_only
+
+statement ok
+SET robust_heuristic = 'largest_root';
+
+statement ok
+SET robust_pass_mode = '${pass_mode}';
+
+query IIII
+SELECT count(*), sum(a.va), sum(b.vb), sum(c.vc)
+FROM a, b, c
+WHERE a.x = b.x AND a.y = b.y AND a.x = c.x;
+----
+400	5000	995000	5000
+
+endloop
+
+# join_order is only covered with forward_only. With the backward pass the ATP
+# broadcast hands the PROBE_FILTER more build columns than probe columns, which
+# is a separate bug; widen this to the full matrix once that is fixed.
+statement ok
+SET robust_heuristic = 'join_order';
+
+statement ok
+SET robust_pass_mode = 'forward_only';
+
+query IIII
+SELECT count(*), sum(a.va), sum(b.vb), sum(c.vc)
+FROM a, b, c
+WHERE a.x = b.x AND a.y = b.y AND a.x = c.x;
+----
+400	5000	995000	5000
+
+endloop
