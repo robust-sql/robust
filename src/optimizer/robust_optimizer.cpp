@@ -1,8 +1,10 @@
 #include "robust_optimizer.hpp"
+#include "redundant_pair_removal.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/common/types.hpp"
 #include "table_manager.hpp"
@@ -75,7 +77,32 @@ void RobustOptimizerContextState::ExtractOperatorsRecursive(LogicalOperator &pla
 
 	switch (op->type) {
 	case LogicalOperatorType::LOGICAL_FILTER: {
+		auto &logical_filter = op->Cast<LogicalFilter>();
 		LogicalOperator *child = op->children[0].get();
+
+		// record base tables that have LOGICAL_FILTERs
+		if (!logical_filter.expressions.empty()) {
+			auto *current = child;
+			while (true) {
+				if (current->children.size() > 2 || current->children.empty()) {
+					break;
+				} else if (current->children.size() == 2) {
+					if (current->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+						break;
+					}
+					auto &join = current->Cast<LogicalComparisonJoin>();
+					if (join.join_type != JoinType::MARK) {
+						break;
+					}
+				}
+				current = current->children[0].get();
+			}
+			if (current->type == LogicalOperatorType::LOGICAL_GET) {
+				auto table_idx = current->Cast<LogicalGet>().table_index;
+				table_with_filters.insert(table_idx);
+			}
+		}
+
 		if (child->type == LogicalOperatorType::LOGICAL_GET) {
 			table_mgr.AddTableOperator(child);
 			return;
@@ -1138,7 +1165,8 @@ RobustOptimizerContextState::GenerateStageModifications(const vector<JoinEdge> &
 std::pair<unordered_map<LogicalOperator *, vector<FilterOperation>>,
           unordered_map<LogicalOperator *, vector<FilterOperation>>>
 RobustOptimizerContextState::GenerateStageModificationsFromDAG(vector<PhysicalDAGNode *> &all_nodes,
-                                                               map<ColKey, ColKey> &uf_parent) {
+                                                               map<ColKey, ColKey> &uf_parent,
+                                                               vector<FilterOpPair> &filter_pairs) {
 	unordered_map<LogicalOperator *, vector<FilterOperation>> forward_filter_ops;
 	unordered_map<LogicalOperator *, vector<FilterOperation>> backward_filter_ops;
 
@@ -1204,6 +1232,7 @@ RobustOptimizerContextState::GenerateStageModificationsFromDAG(vector<PhysicalDA
 				use_op.is_forward_pass = true;
 				use_op.sequence_number = sequence++;
 				forward_filter_ops[parent_node->table_op].push_back(use_op);
+				filter_pairs.push_back({create_op, use_op});
 			}
 		}
 	}
@@ -1267,6 +1296,7 @@ RobustOptimizerContextState::GenerateStageModificationsFromDAG(vector<PhysicalDA
 					use_op.is_forward_pass = false;
 					use_op.sequence_number = sequence++;
 					backward_filter_ops[child_node->table_op].push_back(use_op);
+					filter_pairs.push_back({create_op, use_op});
 				} else {
 					// new equivalence class at this edge — create BF on parent, use on child
 					FilterOperation create_op;
@@ -1290,6 +1320,7 @@ RobustOptimizerContextState::GenerateStageModificationsFromDAG(vector<PhysicalDA
 					use_op.is_forward_pass = false;
 					use_op.sequence_number = sequence++;
 					backward_filter_ops[child_node->table_op].push_back(use_op);
+					filter_pairs.push_back({create_op, use_op});
 
 					// record this as the source for this equivalence class
 					equiv_class_bf_source[equiv_root] = {parent_node->table_op, create_idx, parent_node->table_idx,
@@ -1869,6 +1900,7 @@ unique_ptr<LogicalOperator> RobustOptimizerContextState::Optimize(unique_ptr<Log
 		// use DuckDB's join order DAG
 		map<ColKey, ColKey> uf_parent;
 		auto all_nodes = BuildPhysicalPlanDAG(plan.get(), uf_parent);
+		vector<FilterOpPair> filter_pairs;
 
 		// flip non-largest roots to leaves (default: on)
 		Value flip_val;
@@ -1886,9 +1918,18 @@ unique_ptr<LogicalOperator> RobustOptimizerContextState::Optimize(unique_ptr<Log
 			PrintPhysicalDAG(all_nodes, table_mgr);
 		}
 
-		auto filter_ops = GenerateStageModificationsFromDAG(all_nodes, uf_parent);
+		auto filter_ops = GenerateStageModificationsFromDAG(all_nodes, uf_parent, filter_pairs);
 		forward_filter_ops = std::move(filter_ops.first);
 		backward_filter_ops = std::move(filter_ops.second);
+
+		Value remove_val;
+		bool remove_redundant = true;
+		if (context.TryGetCurrentSetting("robust_remove_redundant_pairs", remove_val)) {
+			remove_redundant = remove_val.GetValue<bool>();
+		}
+		if (remove_redundant) {
+			RemoveRedundantPairs(*this, filter_pairs, forward_filter_ops, backward_filter_ops);
+		}
 	} else {
 		// largest_root
 		mst_edges = LargestRoot(edges);

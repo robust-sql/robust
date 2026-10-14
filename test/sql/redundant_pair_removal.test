@@ -1,0 +1,107 @@
+# name: test/sql/redundant_pair_removal.test
+# group: [sql]
+
+# bloom filter pairs that cannot reject any probe-side row are dropped before the operators
+# are inserted. the two detection rules need different table shapes, so there is a shape that
+# is fully removed and a shape that is fully kept, and robust_remove_redundant_pairs lets both
+# be asserted on the same query.
+#
+# the removal is only wired into the join_order heuristic, so largest_root is not covered here.
+# three tables are needed: with one join edge Robust exits early and inserts nothing at all.
+
+statement ok
+LOAD 'build/release/extension/robust/robust.duckdb_extension';
+
+statement ok
+SET disabled_optimizers = 'join_filter_pushdown';
+
+statement ok
+SET robust_heuristic = 'join_order';
+
+# dense build sides: dim.k is exactly 0..99 and other.k exactly 0..39, so row_count equals the
+# range and every probe value must be present. both bloom filters are provably useless.
+statement ok
+CREATE TABLE dim AS SELECT i AS k FROM range(100) t(i);
+
+statement ok
+CREATE TABLE other AS SELECT i AS k FROM range(40) t(i);
+
+statement ok
+CREATE TABLE fact AS SELECT i%100 AS dk, i%40 AS ok, i AS v FROM range(10000) t(i);
+
+# gapped build sides: 100 rows spread over a range of 199, so row_count cannot prove the domain
+# is dense, and the key sets differ enough that HLL dominance fails. these filters reject real
+# rows (every odd dk, every dk not divisible by 3) and must survive.
+statement ok
+CREATE TABLE dim_gap AS SELECT i*2 AS k FROM range(100) t(i);
+
+statement ok
+CREATE TABLE other_gap AS SELECT i*3 AS k FROM range(40) t(i);
+
+statement ok
+CREATE TABLE fact_gap AS SELECT i%100 AS dk, i%40 AS ok, i AS v FROM range(10000) t(i);
+
+statement ok
+SET robust_pass_mode = 'forward_only';
+
+# with removal disabled the filters are present, which is what makes the negative assertion
+# below meaningful rather than vacuous
+statement ok
+SET robust_remove_redundant_pairs = false;
+
+query II
+EXPLAIN SELECT count(*) FROM dim, fact, other WHERE dim.k = fact.dk AND other.k = fact.ok;
+----
+physical_plan	<REGEX>:.*CREATE_FILTER.*
+
+statement ok
+SET robust_remove_redundant_pairs = true;
+
+# both pairs are redundant, so nothing is left behind
+query II
+EXPLAIN SELECT count(*) FROM dim, fact, other WHERE dim.k = fact.dk AND other.k = fact.ok;
+----
+physical_plan	<!REGEX>:.*CREATE_FILTER.*
+
+query II
+EXPLAIN SELECT count(*) FROM dim, fact, other WHERE dim.k = fact.dk AND other.k = fact.ok;
+----
+physical_plan	<!REGEX>:.*PROBE_FILTER.*
+
+# the gapped shape must keep its filters even with removal enabled
+query II
+EXPLAIN SELECT count(*) FROM dim_gap, fact_gap, other_gap WHERE dim_gap.k = fact_gap.dk AND other_gap.k = fact_gap.ok;
+----
+physical_plan	<REGEX>:.*CREATE_FILTER.*
+
+query II
+EXPLAIN SELECT count(*) FROM dim_gap, fact_gap, other_gap WHERE dim_gap.k = fact_gap.dk AND other_gap.k = fact_gap.ok;
+----
+physical_plan	<REGEX>:.*PROBE_FILTER.*
+
+# removing a pair must not change the answer, in either pass mode. 'both' is the case that
+# exercises the backward pass, where a broadcast CREATE_FILTER is shared across edges and has
+# to be erased column by column
+foreach pass_mode forward_only both
+
+statement ok
+SET robust_pass_mode = '${pass_mode}';
+
+foreach removal true false
+
+statement ok
+SET robust_remove_redundant_pairs = ${removal};
+
+query I
+SELECT count(*) FROM dim, fact, other WHERE dim.k = fact.dk AND other.k = fact.ok;
+----
+10000
+
+query I
+SELECT count(*) FROM dim_gap, fact_gap, other_gap WHERE dim_gap.k = fact_gap.dk AND other_gap.k = fact_gap.ok;
+----
+1750
+
+endloop
+
+endloop

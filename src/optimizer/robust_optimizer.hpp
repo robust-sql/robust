@@ -77,6 +77,8 @@ public:
 
 	unordered_map<ColumnBinding, ColumnBinding, ColumnBindingHashFunction> rename_col_bindings;
 
+	unordered_set<idx_t> table_with_filters;
+
 	bool exist_cycle = false;
 
 public:
@@ -109,7 +111,8 @@ public:
 
 	std::pair<unordered_map<LogicalOperator *, vector<FilterOperation>>,
 	          unordered_map<LogicalOperator *, vector<FilterOperation>>>
-	GenerateStageModificationsFromDAG(vector<PhysicalDAGNode *> &all_nodes, map<ColKey, ColKey> &uf_parent);
+	GenerateStageModificationsFromDAG(vector<PhysicalDAGNode *> &all_nodes, map<ColKey, ColKey> &uf_paren,
+	                                  vector<FilterOpPair> &filter_pairs);
 
 	unique_ptr<LogicalOperator> BuildStackedBFOperators(unique_ptr<LogicalOperator> base_plan,
 	                                                    const vector<FilterOperation> &filter_ops,

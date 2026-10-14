@@ -22,6 +22,7 @@ set(EXTENSION_SOURCES
     src/operators/logical_probe_filter.cpp
     src/operators/physical_probe_filter.cpp
     src/optimizer/robust_optimizer.cpp
+    src/optimizer/redundant_pair_removal.cpp
     src/optimizer/table_manager.cpp
     src/utils/dag_printer.cpp
 )

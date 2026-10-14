@@ -67,6 +67,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::VARCHAR, Value("join_order"));
 	config.AddExtensionOption("robust_flip_roots", "Flip non-largest roots to leaves in join_order DAG",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption("robust_remove_redundant_pairs",
+	                          "Remove bloom filter pairs that provably cannot filter anything", LogicalType::BOOLEAN,
+	                          Value::BOOLEAN(true));
 	config.AddExtensionOption("robust_dynamic_or_filter_threshold",
 	                          "Max distinct build keys to push as IN-filter instead of bloom filter",
 	                          LogicalType::UBIGINT, Value::UBIGINT(50));
