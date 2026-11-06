@@ -8,8 +8,8 @@
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/table_statistics.hpp"
 #include "duckdb/common/types/hyperloglog.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "utils/debug_utils.hpp"
 #include <algorithm>
 
@@ -92,7 +92,7 @@ static void RemoveFilterPair(const FilterOpPair &pair,
 static unique_ptr<BaseStatistics> GetColumnStatistics(RobustOptimizerContextState &state,
                                                       const ColumnBinding &binding) {
 	auto resolved_binding = state.ResolveColumnBinding(binding);
-	auto table_it = state.table_mgr.table_lookup.find(resolved_binding.table_index);
+	auto table_it = state.table_mgr.table_lookup.find(resolved_binding.table_index.index);
 	if (table_it == state.table_mgr.table_lookup.end()) {
 		return nullptr;
 	}
@@ -119,7 +119,7 @@ static unique_ptr<BaseStatistics> GetColumnStatistics(RobustOptimizerContextStat
 
 static idx_t GetBaseTableRowCount(RobustOptimizerContextState &state, const ColumnBinding &binding) {
 	auto resolved_binding = state.ResolveColumnBinding(binding);
-	auto table_it = state.table_mgr.table_lookup.find(resolved_binding.table_index);
+	auto table_it = state.table_mgr.table_lookup.find(resolved_binding.table_index.index);
 	if (table_it == state.table_mgr.table_lookup.end()) {
 		return DConstants::INVALID_INDEX;
 	}
@@ -136,7 +136,7 @@ static idx_t GetBaseTableRowCount(RobustOptimizerContextState &state, const Colu
 
 static unique_ptr<HyperLogLog> GetColumnHLL(RobustOptimizerContextState &state, const ColumnBinding &binding) {
 	auto resolved_binding = state.ResolveColumnBinding(binding);
-	auto table_it = state.table_mgr.table_lookup.find(resolved_binding.table_index);
+	auto table_it = state.table_mgr.table_lookup.find(resolved_binding.table_index.index);
 	if (table_it == state.table_mgr.table_lookup.end()) {
 		return nullptr;
 	}
@@ -194,37 +194,41 @@ struct FilterTableState {
 	idx_t source_idx = DConstants::INVALID_INDEX;
 };
 
-static void TightenProbeRange(BaseStatistics &stats, const TableFilter &filter) {
-	if (filter.filter_type == TableFilterType::CONJUNCTION_AND) {
-		for (auto &child : filter.Cast<ConjunctionAndFilter>().child_filters) {
+static void TightenProbeRange(BaseStatistics &stats, const Expression &expression) {
+	if (expression.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION &&
+	    expression.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+		for (auto &child : expression.Cast<BoundConjunctionExpression>().GetChildren()) {
 			TightenProbeRange(stats, *child);
 		}
 		return;
 	}
-	if (filter.filter_type != TableFilterType::CONSTANT_COMPARISON) {
+	if (expression.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION ||
+	    !BoundComparisonExpression::IsComparison(expression.GetExpressionType())) {
 		return;
 	}
-
-	auto &f = filter.Cast<ConstantFilter>();
+	ExpressionType comparison_type;
+	auto constant =
+	    ExpressionFilter::TryGetColumnConstantComparison(expression.Cast<BoundFunctionExpression>(), comparison_type);
+	if (!constant || constant->GetValue().IsNull()) {
+		return;
+	}
+	const auto &value = constant->GetValue();
 	auto lo = NumericStats::Min(stats);
 	auto hi = NumericStats::Max(stats);
 
-	switch (f.comparison_type) {
+	switch (comparison_type) {
 	case ExpressionType::COMPARE_EQUAL:
-		lo = std::max(lo, f.constant);
-		hi = std::min(hi, f.constant);
+		lo = std::max(lo, value);
+		hi = std::min(hi, value);
 		break;
-
 	case ExpressionType::COMPARE_GREATERTHAN:
 	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
-		lo = std::max(lo, f.constant);
+		lo = std::max(lo, value);
 		break;
-
 	case ExpressionType::COMPARE_LESSTHAN:
 	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
-		hi = std::min(hi, f.constant);
+		hi = std::min(hi, value);
 		break;
-
 	default:
 		return;
 	}
@@ -241,7 +245,7 @@ static void TightenWithLocalPredicate(RobustOptimizerContextState &state, const 
 		return;
 	}
 	auto resolved = state.ResolveColumnBinding(binding);
-	auto table_it = state.table_mgr.table_lookup.find(resolved.table_index);
+	auto table_it = state.table_mgr.table_lookup.find(resolved.table_index.index);
 	if (table_it == state.table_mgr.table_lookup.end()) {
 		return;
 	}
@@ -251,10 +255,9 @@ static void TightenWithLocalPredicate(RobustOptimizerContextState &state, const 
 		return;
 	}
 
-	auto col = get->GetColumnIds()[resolved.column_index].GetPrimaryIndex();
-	auto it = get->table_filters.filters.find(col);
-	if (it != get->table_filters.filters.end()) {
-		TightenProbeRange(stats, *it->second);
+	auto filter = get->table_filters.TryGetFilterByColumnIndex(resolved.column_index);
+	if (filter && filter->filter_type == TableFilterType::EXPRESSION_FILTER) {
+		TightenProbeRange(stats, *filter->Cast<ExpressionFilter>().expr);
 	}
 }
 
@@ -283,33 +286,30 @@ static bool HasFilteringLocalPredicate(RobustOptimizerContextState &state, const
 		D_PRINTF("No matching base table found");
 		return true;
 	}
-	auto &column_ids = get->GetColumnIds();
-
-	for (auto &entry : get->table_filters.filters) {
-		auto &filter = *entry.second;
-
-		if (filter.filter_type == TableFilterType::OPTIONAL_FILTER) {
+	if (get->table_filters.HasMultiColumnFilters()) {
+		return true;
+	}
+	for (auto &entry : get->table_filters) {
+		auto &filter = entry.Filter();
+		if (ExpressionFilter::IsOptionalFilter(filter)) {
 			continue;
 		}
-
-		idx_t filter_column_index = DConstants::INVALID_INDEX;
-		for (idx_t i = 0; i < column_ids.size(); i++) {
-			if (column_ids[i].GetPrimaryIndex() == entry.first) {
-				filter_column_index = i;
-				break;
-			}
+		if (filter.filter_type != TableFilterType::EXPRESSION_FILTER) {
+			return true;
 		}
-		if (filter_column_index == DConstants::INVALID_INDEX) {
+		auto &expression_filter = filter.Cast<ExpressionFilter>();
+		auto filter_column_index = entry.GetIndex();
+		if (filter_column_index.GetIndex() >= get->GetColumnIds().size()) {
 			return true;
 		}
 
 		// check if this local predicate is non-selective
-		ColumnBinding filter_binding(build_table_idx, filter_column_index);
+		ColumnBinding filter_binding(TableIndex(build_table_idx), filter_column_index);
 		auto build_stats = GetColumnStatistics(state, filter_binding);
 		if (!build_stats) {
 			return true;
 		}
-		auto build_result = filter.CheckStatistics(*build_stats);
+		auto build_result = expression_filter.CheckStatistics(state.context, *build_stats);
 		if (build_result == FilterPropagateResult::FILTER_ALWAYS_TRUE) {
 			continue;
 		}
@@ -334,7 +334,7 @@ static bool HasFilteringLocalPredicate(RobustOptimizerContextState &state, const
 
 		TightenWithLocalPredicate(state, probe_binding, *probe_stats);
 
-		auto probe_result = filter.CheckStatistics(*probe_stats);
+		auto probe_result = expression_filter.CheckStatistics(state.context, *probe_stats);
 		if (probe_result != FilterPropagateResult::FILTER_ALWAYS_TRUE) {
 			return true;
 		}

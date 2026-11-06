@@ -1,12 +1,11 @@
 diff --git a/benchmark/interpreted_benchmark.cpp b/benchmark/interpreted_benchmark.cpp
-index 3510fe760e..e3333d6093 100644
 --- a/benchmark/interpreted_benchmark.cpp
 +++ b/benchmark/interpreted_benchmark.cpp
-@@ -62,6 +62,7 @@ struct InterpretedBenchmarkState : public BenchmarkState {
- 			result->options.serialization_compatibility = SerializationCompatibility::FromString(version);
- 		}
+@@ -74,6 +74,3 @@
  		result->options.load_extensions = false;
+-		auto extension_directory = std::getenv(BENCHMARK_EXTENSION_DIRECTORY_ENV);
+-		if (extension_directory && extension_directory[0]) {
+-			result->SetOptionByName("allow_unsigned_extensions", true);
+-		}
 +		result->SetOptionByName("allow_unsigned_extensions", true);
  		return result;
- 	}
- };

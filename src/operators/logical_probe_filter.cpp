@@ -25,7 +25,7 @@ InsertionOrderPreservingMap<string> LogicalProbeFilter::ParamsToString() const {
 		if (i > 0) {
 			probe_cols += ", ";
 		}
-		probe_cols += "(" + to_string(filter_operation.probe_columns[i].table_index) + "." +
+		probe_cols += "(" + to_string(filter_operation.probe_columns[i].table_index.index) + "." +
 		              to_string(filter_operation.probe_columns[i].column_index) + ")";
 	}
 	result["Probe Columns"] = probe_cols;
@@ -62,14 +62,16 @@ PhysicalOperator &LogicalProbeFilter::CreatePlan(ClientContext &context, Physica
 		Printer::Print(StringUtil::Format("[RESOLVE] child_bindings.size()=%zu", child_bindings.size()));
 		for (idx_t j = 0; j < child_bindings.size(); j++) {
 			Printer::Print(StringUtil::Format("  child_bindings[%llu] = table_idx=%llu, col_idx=%llu",
-			                                  (unsigned long long)j, (unsigned long long)child_bindings[j].table_index,
+			                                  (unsigned long long)j,
+			                                  (unsigned long long)child_bindings[j].table_index.index,
 			                                  (unsigned long long)child_bindings[j].column_index));
 		}
 #endif
 
 		for (const ColumnBinding &column_binding : input_bindings) {
 			D_PRINTF("[RESOLVE] Looking for probe_column: table_idx=%llu, col_idx=%llu",
-			         (unsigned long long)column_binding.table_index, (unsigned long long)column_binding.column_index);
+			         (unsigned long long)column_binding.table_index.index,
+			         (unsigned long long)column_binding.column_index);
 			// find the position of the filter column ColumnBinding in the chunk columns
 			for (idx_t i = 0; i < child_bindings.size(); i++) {
 				if (child_bindings[i].table_index == column_binding.table_index &&

@@ -11,7 +11,7 @@ namespace duckdb {
 // hash function for ColumnBinding to use as map key
 struct ColumnBindingHash {
 	size_t operator()(const ColumnBinding &binding) const {
-		return std::hash<idx_t>()(binding.table_index) ^ (std::hash<idx_t>()(binding.column_index) << 16);
+		return std::hash<TableIndex>()(binding.table_index) ^ (std::hash<idx_t>()(binding.column_index) << 16);
 	}
 };
 

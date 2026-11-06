@@ -69,27 +69,27 @@ SET robust_flip_roots = ${flip_roots};
 
 # Negative: no join appear
 query II
-EXPLAIN SELECT count(*)
+EXPLAIN (FORMAT JSON) SELECT count(*)
 FROM t1
 ----
 physical_plan	<!REGEX>:.*CREATE_FILTER.*
 
 query II
-EXPLAIN SELECT count(*)
+EXPLAIN (FORMAT JSON) SELECT count(*)
 FROM t1
 ----
 physical_plan	<!REGEX>:.*PROBE_FILTER.*
 
 # Negative: two-way join
 query II
-EXPLAIN SELECT count(*)
+EXPLAIN (FORMAT JSON) SELECT count(*)
 FROM t1, t2
 WHERE t1.k12 = t2.k12;
 ----
 physical_plan	<!REGEX>:.*CREATE_FILTER.*
 
 query II
-EXPLAIN SELECT count(*)
+EXPLAIN (FORMAT JSON) SELECT count(*)
 FROM t1, t2
 WHERE t1.k12 = t2.k12;
 ----
@@ -97,14 +97,14 @@ physical_plan	<!REGEX>:.*PROBE_FILTER.*
 
 # Negative: two-way join and tree tables appear
 query II
-EXPLAIN SELECT count(*)
+EXPLAIN (FORMAT JSON) SELECT count(*)
 FROM t1, t2, t3
 WHERE t1.k12 = t2.k12;
 ----
 physical_plan	<!REGEX>:.*CREATE_FILTER.*
 
 query II
-EXPLAIN SELECT count(*)
+EXPLAIN (FORMAT JSON) SELECT count(*)
 FROM t1, t2, t3
 WHERE t1.k12 = t2.k12;
 ----
@@ -112,7 +112,7 @@ physical_plan	<!REGEX>:.*PROBE_FILTER.*
 
 # Negative: two joins appear but both not equality join
 query II
-EXPLAIN SELECT count(*)
+EXPLAIN (FORMAT JSON) SELECT count(*)
 FROM t1, t2, t3
 WHERE t1.k12 < t2.k12
 AND t2.k23 < t3.k23;
@@ -120,7 +120,7 @@ AND t2.k23 < t3.k23;
 physical_plan	<!REGEX>:.*CREATE_FILTER.*
 
 query II
-EXPLAIN SELECT count(*)
+EXPLAIN (FORMAT JSON) SELECT count(*)
 FROM t1, t2, t3
 WHERE t1.k12 < t2.k12
 AND t2.k23 < t3.k23;
@@ -129,7 +129,7 @@ physical_plan	<!REGEX>:.*PROBE_FILTER.*
 
 # Negative: two joins appear but one is not equality join
 query II
-EXPLAIN SELECT count(*)
+EXPLAIN (FORMAT JSON) SELECT count(*)
 FROM t1, t2, t3
 WHERE t1.k12 < t2.k12
 AND t2.k23 = t3.k23;
@@ -137,7 +137,7 @@ AND t2.k23 = t3.k23;
 physical_plan	<!REGEX>:.*CREATE_FILTER.*
 
 query II
-EXPLAIN SELECT count(*)
+EXPLAIN (FORMAT JSON) SELECT count(*)
 FROM t1, t2, t3
 WHERE t1.k12 < t2.k12
 AND t2.k23 = t3.k23;
@@ -146,7 +146,7 @@ physical_plan	<!REGEX>:.*PROBE_FILTER.*
 
 # Negative: cyclic join graph (triangle) - predicate transfer bails out entirely
 query II
-EXPLAIN SELECT count(*)
+EXPLAIN (FORMAT JSON) SELECT count(*)
 FROM t2, t3, t4
 WHERE t2.k23 = t3.k23
   AND t3.k34 = t4.k34
@@ -155,7 +155,7 @@ WHERE t2.k23 = t3.k23
 physical_plan	<!REGEX>:.*CREATE_FILTER.*
 
 query II
-EXPLAIN SELECT count(*)
+EXPLAIN (FORMAT JSON) SELECT count(*)
 FROM t2, t3, t4
 WHERE t2.k23 = t3.k23
   AND t3.k34 = t4.k34
@@ -165,7 +165,7 @@ physical_plan	<!REGEX>:.*PROBE_FILTER.*
 
 # Negative: cyclic join graph (4-cycle, TPC-H Q5 shape)
 query II
-EXPLAIN SELECT count(*)
+EXPLAIN (FORMAT JSON) SELECT count(*)
 FROM t1, t2, t3, t4
 WHERE t1.k12 = t2.k12
   AND t2.k23 = t3.k23
@@ -175,7 +175,7 @@ WHERE t1.k12 = t2.k12
 physical_plan	<!REGEX>:.*CREATE_FILTER.*
 
 query II
-EXPLAIN SELECT count(*)
+EXPLAIN (FORMAT JSON) SELECT count(*)
 FROM t1, t2, t3, t4
 WHERE t1.k12 = t2.k12
   AND t2.k23 = t3.k23

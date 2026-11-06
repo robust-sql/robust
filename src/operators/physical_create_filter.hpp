@@ -5,7 +5,7 @@
 #include "../optimizer/graph_manager.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include <duckdb/common/types/column/column_data_scan_states.hpp>
-#include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
 #include "duckdb/common/types/value_map.hpp"
 
 namespace duckdb {
@@ -25,7 +25,8 @@ public:
 	~PhysicalCreateFilter() override = default;
 
 	string GetName() const override;
-	string ToString(ExplainFormat format = ExplainFormat::DEFAULT) const override;
+	string ToString(optional_ptr<ClientContext> context = nullptr,
+	                const ProfilerPrintFormat &format = ProfilerPrintFormat::Default()) const override;
 
 	// populate info in query plan
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
@@ -87,7 +88,7 @@ public:
 	// dynamic filter pushdown to table scans (forward pass only)
 	struct DynamicFilterTarget {
 		shared_ptr<DynamicTableFilterSet> dynamic_filters;
-		idx_t scan_column_index;
+		ProjectionIndex scan_column_index;
 		ColumnBinding probe_column;
 		LogicalType column_type;
 		string column_name;

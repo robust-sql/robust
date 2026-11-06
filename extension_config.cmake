@@ -5,7 +5,6 @@ duckdb_extension_load(robust
     SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}
     INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/src
     LOAD_TESTS
-    DONT_LINK
 )
 
 # Any extra extensions that should be built
@@ -14,3 +13,4 @@ duckdb_extension_load(robust
 # tpch: statically linked so the benchmark_runner can CALL dbgen / run the
 # tpch benchmark suites (scripts/bench_tpch.sh). Required by `require tpch`.
 duckdb_extension_load(tpch)
+duckdb_extension_statically_link(tpch)

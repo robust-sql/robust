@@ -50,7 +50,7 @@ statement ok
 SET robust_remove_redundant_pairs = false;
 
 query II
-EXPLAIN SELECT count(*) FROM dim, fact, other WHERE dim.k = fact.dk AND other.k = fact.ok;
+EXPLAIN (FORMAT JSON) SELECT count(*) FROM dim, fact, other WHERE dim.k = fact.dk AND other.k = fact.ok;
 ----
 physical_plan	<REGEX>:.*CREATE_FILTER.*
 
@@ -59,23 +59,23 @@ SET robust_remove_redundant_pairs = true;
 
 # both pairs are redundant, so nothing is left behind
 query II
-EXPLAIN SELECT count(*) FROM dim, fact, other WHERE dim.k = fact.dk AND other.k = fact.ok;
+EXPLAIN (FORMAT JSON) SELECT count(*) FROM dim, fact, other WHERE dim.k = fact.dk AND other.k = fact.ok;
 ----
 physical_plan	<!REGEX>:.*CREATE_FILTER.*
 
 query II
-EXPLAIN SELECT count(*) FROM dim, fact, other WHERE dim.k = fact.dk AND other.k = fact.ok;
+EXPLAIN (FORMAT JSON) SELECT count(*) FROM dim, fact, other WHERE dim.k = fact.dk AND other.k = fact.ok;
 ----
 physical_plan	<!REGEX>:.*PROBE_FILTER.*
 
 # the gapped shape must keep its filters even with removal enabled
 query II
-EXPLAIN SELECT count(*) FROM dim_gap, fact_gap, other_gap WHERE dim_gap.k = fact_gap.dk AND other_gap.k = fact_gap.ok;
+EXPLAIN (FORMAT JSON) SELECT count(*) FROM dim_gap, fact_gap, other_gap WHERE dim_gap.k = fact_gap.dk AND other_gap.k = fact_gap.ok;
 ----
 physical_plan	<REGEX>:.*CREATE_FILTER.*
 
 query II
-EXPLAIN SELECT count(*) FROM dim_gap, fact_gap, other_gap WHERE dim_gap.k = fact_gap.dk AND other_gap.k = fact_gap.ok;
+EXPLAIN (FORMAT JSON) SELECT count(*) FROM dim_gap, fact_gap, other_gap WHERE dim_gap.k = fact_gap.dk AND other_gap.k = fact_gap.ok;
 ----
 physical_plan	<REGEX>:.*PROBE_FILTER.*
 
