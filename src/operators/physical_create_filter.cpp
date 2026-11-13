@@ -9,11 +9,11 @@
 #include "robust_profiling.hpp"
 #include "probe_empty_registry.hpp"
 #include <duckdb/parallel/meta_pipeline.hpp>
-#include "duckdb/planner/filter/bloom_filter.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
-#include "duckdb/planner/filter/selectivity_optional_filter.hpp"
-#include "duckdb/planner/filter/in_filter.hpp"
-#include "duckdb/planner/filter/optional_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/filter/table_filter_functions.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/optimizer/filter_combiner.hpp"
 #include "duckdb/main/config.hpp"
 
@@ -37,7 +37,7 @@ string PhysicalCreateFilter::GetName() const {
 	return "CREATE_FILTER";
 }
 
-string PhysicalCreateFilter::ToString(ExplainFormat format) const {
+string PhysicalCreateFilter::ToString(optional_ptr<ClientContext> context, const ProfilerPrintFormat &format) const {
 	string result = "CREATE_FILTER";
 	result += " [" + std::to_string(filter_operation->build_columns.size()) + " filters]";
 	return result;
@@ -53,7 +53,7 @@ InsertionOrderPreservingMap<string> PhysicalCreateFilter::ParamsToString() const
 	for (const auto &col : filter_operation->probe_columns) {
 		bool found = false;
 		for (auto idx : seen_probe) {
-			if (idx == col.table_index) {
+			if (idx == col.table_index.index) {
 				found = true;
 				break;
 			}
@@ -62,8 +62,8 @@ InsertionOrderPreservingMap<string> PhysicalCreateFilter::ParamsToString() const
 			if (!probe_tables.empty()) {
 				probe_tables += ", ";
 			}
-			probe_tables += to_string(col.table_index);
-			seen_probe.push_back(col.table_index);
+			probe_tables += to_string(col.table_index.index);
+			seen_probe.push_back(col.table_index.index);
 		}
 	}
 	result["Probe Tables"] = probe_tables;
@@ -73,7 +73,7 @@ InsertionOrderPreservingMap<string> PhysicalCreateFilter::ParamsToString() const
 		if (i > 0) {
 			build_cols += ", ";
 		}
-		build_cols += "(" + to_string(filter_operation->build_columns[i].table_index) + "." +
+		build_cols += "(" + to_string(filter_operation->build_columns[i].table_index.index) + "." +
 		              to_string(filter_operation->build_columns[i].column_index) + ")";
 	}
 	result["Build Columns"] = build_cols;
@@ -90,20 +90,15 @@ InsertionOrderPreservingMap<string> PhysicalCreateFilter::ParamsToString() const
 //===--------------------------------------------------------------------===//
 
 template <typename T>
-static void TypedUpdateMinMax(Vector &vec, idx_t count, ColumnMinMax &mm) {
-	UnifiedVectorFormat vdata;
-	vec.ToUnifiedFormat(count, vdata);
-	auto *data = UnifiedVectorFormat::GetData<T>(vdata);
-
+static void TypedUpdateMinMax(Vector &vec, ColumnMinMax &mm) {
 	T local_min {}, local_max {};
 	bool has_val = false;
 
-	for (idx_t row = 0; row < count; row++) {
-		auto idx = vdata.sel->get_index(row);
-		if (!vdata.validity.RowIsValid(idx)) {
+	for (auto entry : vec.Values<T>()) {
+		if (!entry.IsValid()) {
 			continue;
 		}
-		const auto &val = data[idx];
+		const auto &val = entry.GetValue();
 		if (!has_val) {
 			local_min = val;
 			local_max = val;
@@ -138,47 +133,47 @@ static void TypedUpdateMinMax(Vector &vec, idx_t count, ColumnMinMax &mm) {
 	}
 }
 
-static void UpdateMinMax(Vector &vec, idx_t count, ColumnMinMax &mm) {
+static void UpdateMinMax(Vector &vec, ColumnMinMax &mm) {
 	auto &type = vec.GetType();
 	switch (type.id()) {
 	case LogicalTypeId::TINYINT:
-		TypedUpdateMinMax<int8_t>(vec, count, mm);
+		TypedUpdateMinMax<int8_t>(vec, mm);
 		break;
 	case LogicalTypeId::SMALLINT:
-		TypedUpdateMinMax<int16_t>(vec, count, mm);
+		TypedUpdateMinMax<int16_t>(vec, mm);
 		break;
 	case LogicalTypeId::INTEGER:
-		TypedUpdateMinMax<int32_t>(vec, count, mm);
+		TypedUpdateMinMax<int32_t>(vec, mm);
 		break;
 	case LogicalTypeId::BIGINT:
-		TypedUpdateMinMax<int64_t>(vec, count, mm);
+		TypedUpdateMinMax<int64_t>(vec, mm);
 		break;
 	case LogicalTypeId::UTINYINT:
-		TypedUpdateMinMax<uint8_t>(vec, count, mm);
+		TypedUpdateMinMax<uint8_t>(vec, mm);
 		break;
 	case LogicalTypeId::USMALLINT:
-		TypedUpdateMinMax<uint16_t>(vec, count, mm);
+		TypedUpdateMinMax<uint16_t>(vec, mm);
 		break;
 	case LogicalTypeId::UINTEGER:
-		TypedUpdateMinMax<uint32_t>(vec, count, mm);
+		TypedUpdateMinMax<uint32_t>(vec, mm);
 		break;
 	case LogicalTypeId::UBIGINT:
-		TypedUpdateMinMax<uint64_t>(vec, count, mm);
+		TypedUpdateMinMax<uint64_t>(vec, mm);
 		break;
 	case LogicalTypeId::FLOAT:
-		TypedUpdateMinMax<float>(vec, count, mm);
+		TypedUpdateMinMax<float>(vec, mm);
 		break;
 	case LogicalTypeId::DOUBLE:
-		TypedUpdateMinMax<double>(vec, count, mm);
+		TypedUpdateMinMax<double>(vec, mm);
 		break;
 	case LogicalTypeId::DATE:
-		TypedUpdateMinMax<date_t>(vec, count, mm);
+		TypedUpdateMinMax<date_t>(vec, mm);
 		break;
 	case LogicalTypeId::TIMESTAMP:
-		TypedUpdateMinMax<timestamp_t>(vec, count, mm);
+		TypedUpdateMinMax<timestamp_t>(vec, mm);
 		break;
 	case LogicalTypeId::VARCHAR:
-		TypedUpdateMinMax<string_t>(vec, count, mm);
+		TypedUpdateMinMax<string_t>(vec, mm);
 		break;
 	default:
 		break;
@@ -251,7 +246,7 @@ SinkResultType PhysicalCreateFilter::Sink(ExecutionContext &context, DataChunk &
 				continue;
 			}
 			auto &vec = chunk.data[col_idx];
-			UpdateMinMax(vec, chunk.size(), local_state.local_min_max[i]);
+			UpdateMinMax(vec, local_state.local_min_max[i]);
 		}
 	}
 
@@ -358,8 +353,10 @@ static void PushDynamicFilters(const PhysicalCreateFilter &op, const CreateFilte
 	// if build side produced 0 rows, no probe-side rows can match — push always-false filter
 	if (gsink.total_data->Count() == 0) {
 		for (auto &target : op.pushdown_targets) {
-			auto always_false =
-			    make_uniq<ConstantFilter>(ExpressionType::COMPARE_GREATERTHAN, Value::MaximumValue(target.column_type));
+			// Keep a comparison expression so zonemap pruning can skip every row group.
+			auto always_false = make_uniq<ExpressionFilter>(BoundComparisonExpression::Create(
+			    ExpressionType::COMPARE_EQUAL, make_uniq<BoundConstantExpression>(Value::INTEGER(0)),
+			    make_uniq<BoundConstantExpression>(Value::INTEGER(1))));
 			target.dynamic_filters->PushFilter(op, target.scan_column_index, std::move(always_false));
 			D_PRINTF("[PUSHDOWN] pushed always-false for col %s (empty build side)", target.column_name.c_str());
 		}
@@ -382,7 +379,7 @@ static void PushDynamicFilters(const PhysicalCreateFilter &op, const CreateFilte
 				break;
 			}
 			const auto &probe_col = op.filter_operation->probe_columns[i];
-			if (probe_col.table_index != target.probe_column.table_index ||
+			if (probe_col.table_index.index != target.probe_column.table_index.index ||
 			    probe_col.column_index != target.probe_column.column_index) {
 				continue;
 			}
@@ -395,15 +392,18 @@ static void PushDynamicFilters(const PhysicalCreateFilter &op, const CreateFilte
 			if (consider_in && i < gsink.column_distinct.size()) {
 				auto &cd = gsink.column_distinct[i];
 				if (!cd.over_threshold && cd.values.size() == 1) {
-					auto eq = make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL, *cd.values.begin());
+					auto eq =
+					    ExpressionFilter::CreateComparisonFilter(ExpressionType::COMPARE_EQUAL, *cd.values.begin());
 					target.dynamic_filters->PushFilter(op, target.scan_column_index, std::move(eq));
 					pushed_equal = true;
 					D_PRINTF("[PUSHDOWN] pushed equality constant for col %s", target.column_name.c_str());
 				} else if (!cd.over_threshold && cd.values.size() > 1) {
 					vector<Value> in_list(cd.values.begin(), cd.values.end());
 					if (!FilterCombiner::ContainsNull(in_list) && !FilterCombiner::IsDenseRange(in_list)) {
-						auto in_f = make_uniq<InFilter>(std::move(in_list));
-						auto opt = make_uniq<OptionalFilter>(std::move(in_f));
+						auto in_expr = ExpressionFilter::CreateInExpression(
+						    make_uniq<BoundReferenceExpression>(target.column_type, 0ULL), std::move(in_list));
+						auto opt = make_uniq<ExpressionFilter>(
+						    CreateOptionalFilterExpression(std::move(in_expr), target.column_type));
 						target.dynamic_filters->PushFilter(op, target.scan_column_index, std::move(opt));
 						D_PRINTF("[PUSHDOWN] pushed IN-filter (%llu values) for col %s",
 						         (unsigned long long)cd.values.size(), target.column_name.c_str());
@@ -416,10 +416,16 @@ static void PushDynamicFilters(const PhysicalCreateFilter &op, const CreateFilte
 			if (push_bf && !pushed_equal) {
 				auto bf_it = op.bloom_filter_map.find(build_col);
 				if (bf_it != op.bloom_filter_map.end() && bf_it->second && !bf_it->second->IsEmpty()) {
-					auto bf_filter = make_uniq<BFTableFilter>(bf_it->second->GetNativeFilter(), false,
-					                                          target.column_name, target.column_type);
-					auto wrapped = make_uniq<SelectivityOptionalFilter>(std::move(bf_filter), 1, 1000000);
-					target.dynamic_filters->PushFilter(op, target.scan_column_index, std::move(wrapped));
+					vector<unique_ptr<Expression>> arguments;
+					arguments.push_back(make_uniq<BoundReferenceExpression>(target.column_type, 0ULL));
+					// Keep scan-side Bloom checks active by disabling selectivity tracking.
+					auto bf_expr = make_uniq<BoundFunctionExpression>(
+					    BoundScalarFunction(BloomFilterScalarFun::GetFunction(target.column_type)),
+					    std::move(arguments),
+					    make_uniq<BloomFilterFunctionData>(bf_it->second->GetNativeFilter(), false, target.column_name,
+					                                       target.column_type, 0.0f, idx_t(0)));
+					auto bf_filter = make_uniq<ExpressionFilter>(std::move(bf_expr));
+					target.dynamic_filters->PushFilter(op, target.scan_column_index, std::move(bf_filter));
 					D_PRINTF("[PUSHDOWN] pushed BF for col %s to scan col %llu", target.column_name.c_str(),
 					         (unsigned long long)target.scan_column_index);
 				}
@@ -428,10 +434,12 @@ static void PushDynamicFilters(const PhysicalCreateFilter &op, const CreateFilte
 			// equality filter already expresses min/max; skip min/max push in that case
 			if (push_minmax && !pushed_equal && i < gsink.column_min_max.size() && gsink.column_min_max[i].has_value) {
 				auto &mm = gsink.column_min_max[i];
-				auto min_filter = make_uniq<ConstantFilter>(ExpressionType::COMPARE_GREATERTHANOREQUALTO, mm.min_val);
+				auto min_filter =
+				    ExpressionFilter::CreateComparisonFilter(ExpressionType::COMPARE_GREATERTHANOREQUALTO, mm.min_val);
 				target.dynamic_filters->PushFilter(op, target.scan_column_index, std::move(min_filter));
 
-				auto max_filter = make_uniq<ConstantFilter>(ExpressionType::COMPARE_LESSTHANOREQUALTO, mm.max_val);
+				auto max_filter =
+				    ExpressionFilter::CreateComparisonFilter(ExpressionType::COMPARE_LESSTHANOREQUALTO, mm.max_val);
 				target.dynamic_filters->PushFilter(op, target.scan_column_index, std::move(max_filter));
 
 				D_PRINTF("[PUSHDOWN] pushed min-max for col %s [%s, %s]", target.column_name.c_str(),
@@ -452,7 +460,7 @@ void PhysicalCreateFilter::PostBuildFinalize(const CreateFilterGlobalSinkState &
 
 	for (auto &entry : bloom_filter_map) {
 		if (entry.second) {
-			entry.second->finalized_ = true;
+			entry.second->Seal(context);
 		}
 	}
 

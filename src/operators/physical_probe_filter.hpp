@@ -35,7 +35,8 @@ public:
 	~PhysicalProbeFilter() override = default;
 
 	string GetName() const override;
-	string ToString(ExplainFormat format = ExplainFormat::DEFAULT) const override;
+	string ToString(optional_ptr<ClientContext> context = nullptr,
+	                const ProfilerPrintFormat &format = ProfilerPrintFormat::Default()) const override;
 
 	// populate info in query plan
 	InsertionOrderPreservingMap<string> ParamsToString() const override;

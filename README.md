@@ -1,10 +1,10 @@
 # Robust
 
 [![CI](https://github.com/robust-sql/robust/actions/workflows/MainDistributionPipeline.yml/badge.svg)](https://github.com/robust-sql/robust/actions/workflows/MainDistributionPipeline.yml)
-[![DuckDB](https://img.shields.io/badge/DuckDB-v1.5.3-blue)](https://github.com/duckdb/duckdb/releases/tag/v1.5.3)
-[![extension-ci-tools](https://img.shields.io/badge/extension--ci--tools-v1.5.3-blue)](https://github.com/duckdb/extension-ci-tools/tree/v1.5.3)
+[![DuckDB](https://img.shields.io/badge/DuckDB-v2.0.0-blue)](https://github.com/duckdb/duckdb/releases/tag/v2.0.0)
+[![extension-ci-tools](https://img.shields.io/badge/extension--ci--tools-v2.0--cyanoptera-blue)](https://github.com/duckdb/extension-ci-tools/tree/v2.0-cyanoptera)
 [![status](https://img.shields.io/badge/status-WIP-orange)](#current-status)
-<!-- JOB performance badges (geomean speedup, memory ratio) removed pending re-measurement on DuckDB v1.5.3. -->
+<!-- JOB performance badges (geomean speedup, memory ratio) removed pending re-measurement on DuckDB v2.0.0. -->
 <!-- [![JOB speedup](https://img.shields.io/badge/JOB_geomean-1.76×-brightgreen)](#benchmark-results) -->
 <!-- [![JOB memory](https://img.shields.io/badge/JOB_memory-1.67×_lower-brightgreen)](#benchmark-results) -->
 
@@ -291,8 +291,8 @@ The bloom filter is one of three filter types pushed in a single `CREATE_FILTER`
 
 | Dependency | Pin | Notes |
 |---|---|---|
-| `duckdb` submodule | [`v1.5.3`](https://github.com/duckdb/duckdb/releases/tag/v1.5.3) | release tag |
-| `extension-ci-tools` submodule | [`v1.5.3`](https://github.com/duckdb/extension-ci-tools/tree/v1.5.3) | `v1.5.3` branch tip |
+| `duckdb` submodule | [`v2.0.0`](https://github.com/duckdb/duckdb/releases/tag/v2.0.0) | release tag |
+| `extension-ci-tools` submodule | [`v2.0-cyanoptera`](https://github.com/duckdb/extension-ci-tools/tree/v2.0-cyanoptera) | `v2.0-cyanoptera` branch tip |
 | OpenSSL | 3.5.3+ via vcpkg | dependency of DuckDB build |
 
 CI pins are kept in sync with submodule pins in [`.github/workflows/MainDistributionPipeline.yml`](.github/workflows/MainDistributionPipeline.yml).

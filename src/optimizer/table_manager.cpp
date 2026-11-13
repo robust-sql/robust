@@ -49,13 +49,13 @@ idx_t TableManager::GetScalarTableIndex(LogicalOperator *op) {
 	case LogicalOperatorType::LOGICAL_EXCEPT:
 	case LogicalOperatorType::LOGICAL_INTERSECT:
 	case LogicalOperatorType::LOGICAL_CTE_REF: {
-		return op->GetTableIndex()[0];
+		return op->GetTableIndex()[0].index;
 	}
 	case LogicalOperatorType::LOGICAL_FILTER: {
 		return GetScalarTableIndex(op->children[0].get());
 	}
 	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
-		return op->GetTableIndex()[1];
+		return op->GetTableIndex()[1].index;
 	}
 	default:
 		return std::numeric_limits<idx_t>::max();
@@ -117,7 +117,7 @@ string TableManager::GetTableName(idx_t table_idx) {
 	if (get) {
 		auto table = get->GetTable();
 		if (table) {
-			return table->name;
+			return table->name.GetIdentifierName();
 		}
 	}
 	return "table_" + std::to_string(table_idx);
@@ -136,7 +136,7 @@ string TableManager::GetColumnName(idx_t table_idx, idx_t column_index) {
 	if (column_index < col_ids.size()) {
 		idx_t primary_idx = col_ids[column_index].GetPrimaryIndex();
 		if (primary_idx < get->names.size()) {
-			return get->names[primary_idx];
+			return get->names[primary_idx].GetIdentifierName();
 		}
 	}
 	return "col_" + std::to_string(column_index);

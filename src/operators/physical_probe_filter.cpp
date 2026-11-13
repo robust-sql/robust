@@ -21,7 +21,7 @@ string PhysicalProbeFilter::GetName() const {
 	return "PROBE_FILTER";
 }
 
-string PhysicalProbeFilter::ToString(ExplainFormat format) const {
+string PhysicalProbeFilter::ToString(optional_ptr<ClientContext> context, const ProfilerPrintFormat &format) const {
 	string result = "PROBE_FILTER";
 	if (is_passthrough) {
 		result += " (passthrough, pushed to scan)";
@@ -43,7 +43,7 @@ InsertionOrderPreservingMap<string> PhysicalProbeFilter::ParamsToString() const 
 		if (i > 0) {
 			probe_cols += ", ";
 		}
-		probe_cols += "(" + to_string(filter_operation->probe_columns[i].table_index) + "." +
+		probe_cols += "(" + to_string(filter_operation->probe_columns[i].table_index.index) + "." +
 		              to_string(filter_operation->probe_columns[i].column_index) + ")";
 	}
 	result["Probe Columns"] = probe_cols;
@@ -101,8 +101,8 @@ OperatorResultType PhysicalProbeFilter::ExecuteInternal(ExecutionContext &contex
 						        : "unknown";
 						D_PRINTF("[EXEC_INTERNAL] PROBE_FILTER found bloom filter for col(%llu,%llu) from "
 						         "CREATE_FILTER (build=%s)",
-						         (unsigned long long)build_col.table_index, (unsigned long long)build_col.column_index,
-						         build_table.c_str());
+						         (unsigned long long)build_col.table_index.index,
+						         (unsigned long long)build_col.column_index, build_table.c_str());
 						state.bloom_filters.push_back(bf);
 						state.sel_vector.emplace_back(STANDARD_VECTOR_SIZE);
 						break; // found the filter for this column
@@ -161,7 +161,7 @@ OperatorResultType PhysicalProbeFilter::ExecuteInternal(ExecutionContext &contex
 			if (profiling_stats) {
 				profiling_stats->rows_in.fetch_add(original_row_num, std::memory_order_relaxed);
 			}
-			chunk.SetCardinality(0);
+			chunk.SetChildCardinality(0);
 			return OperatorResultType::NEED_MORE_INPUT;
 		}
 
@@ -180,7 +180,7 @@ OperatorResultType PhysicalProbeFilter::ExecuteInternal(ExecutionContext &contex
 			if (profiling_stats) {
 				profiling_stats->rows_in.fetch_add(original_row_num, std::memory_order_relaxed);
 			}
-			chunk.SetCardinality(0);
+			chunk.SetChildCardinality(0);
 			return OperatorResultType::NEED_MORE_INPUT;
 		}
 
