@@ -165,13 +165,15 @@ void RobustOptimizerContextState::ExtractOperatorsRecursive(LogicalOperator &pla
 		ExtractOperatorsRecursive(*op->children[0], join_ops);
 		return;
 	}
+	case LogicalOperatorType::LOGICAL_CTE_REF: {
+		return;
+	}
 	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
 	case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
 	case LogicalOperatorType::LOGICAL_DELIM_GET:
 	case LogicalOperatorType::LOGICAL_GET:
 	case LogicalOperatorType::LOGICAL_EMPTY_RESULT:
 	case LogicalOperatorType::LOGICAL_CHUNK_GET:
-	case LogicalOperatorType::LOGICAL_CTE_REF:
 		D_PRINTF("[NODE_REG] Registering base table scan, type=%d", (int)op->type);
 		table_mgr.AddTableOperator(op);
 		return;
