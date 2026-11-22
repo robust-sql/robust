@@ -6,6 +6,10 @@
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/binder.hpp"
+#include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/common/types.hpp"
 #include "table_manager.hpp"
@@ -27,12 +31,103 @@ namespace duckdb {
 // class LogicalCreateFilter;
 // class LogicalProbeFilter;
 
+static bool IsInequality(ExpressionType type) {
+	return BoundComparisonExpression::IsComparison(type) && type != ExpressionType::COMPARE_EQUAL &&
+	       type != ExpressionType::COMPARE_NOT_DISTINCT_FROM;
+}
+
+static bool HasInequality(const Expression &expr) {
+	if (IsInequality(expr.GetExpressionType())) {
+		return true;
+	}
+	bool found = false;
+	ExpressionIterator::EnumerateChildren(expr,
+	                                      [&](const Expression &child) { found = found || HasInequality(child); });
+	return found;
+}
+
+// equality join with inequality condition and anti/right_anti join qualify
+static bool IsJoinOutputNode(LogicalOperator &op) {
+	const bool has_filter = op.type == LogicalOperatorType::LOGICAL_FILTER;
+	auto &child = has_filter ? *op.children[0] : op;
+	const bool any_join = child.type == LogicalOperatorType::LOGICAL_ANY_JOIN;
+	if (!any_join && child.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+	    child.type != LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+		return false;
+	}
+	auto &join = child.Cast<LogicalJoin>();
+	if (join.join_type == JoinType::ANTI || join.join_type == JoinType::RIGHT_ANTI) {
+		return true;
+	}
+
+	if (any_join || join.join_type == JoinType::MARK) {
+		return false;
+	}
+	auto &comparison_join = child.Cast<LogicalComparisonJoin>();
+	bool has_equality = false;
+	bool has_inequality = false;
+	for (auto &cond : comparison_join.conditions) {
+		if (cond.IsComparison()) {
+			auto type = cond.GetComparisonType();
+			has_equality |= type == ExpressionType::COMPARE_EQUAL || type == ExpressionType::COMPARE_NOT_DISTINCT_FROM;
+			has_inequality |= IsInequality(type);
+		} else {
+			has_inequality = has_inequality || HasInequality(cond.GetJoinExpression());
+		}
+	}
+	if (!has_equality) {
+		return false;
+	}
+	if (has_inequality) {
+		return true;
+	}
+	if (has_filter) {
+		for (auto &expr : op.expressions) {
+			if (HasInequality(*expr)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+struct JoinOutputCandidate {
+	LogicalOperator *op = nullptr;
+	idx_t join_depth = 0;
+};
+
+static void FindDeepestJoinOutput(LogicalOperator &op, idx_t depth, JoinOutputCandidate &best,
+                                  unordered_set<LogicalOperator *> &excluded_join_conditions) {
+	if (IsJoinOutputNode(op)) {
+		if (!best.op || depth > best.join_depth) {
+			best = {&op, depth};
+		}
+		auto &join = (op.type == LogicalOperatorType::LOGICAL_FILTER ? *op.children[0] : op).Cast<LogicalJoin>();
+		if (join.join_type != JoinType::INNER && join.join_type != JoinType::SEMI &&
+		    join.join_type != JoinType::RIGHT_SEMI) {
+			excluded_join_conditions.insert(&join);
+		}
+	}
+	const bool is_join = dynamic_cast<LogicalJoin *>(&op) || op.type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT ||
+	                     op.type == LogicalOperatorType::LOGICAL_POSITIONAL_JOIN;
+	for (idx_t i = op.children.size(); i > 0; --i) {
+		FindDeepestJoinOutput(*op.children[i - 1], depth + is_join, best, excluded_join_conditions);
+	}
+}
+
 vector<JoinEdge> RobustOptimizerContextState::ExtractOperators(LogicalOperator &plan) {
 	vector<LogicalOperator *> join_ops;
 	vector<TableInfo> table_infos;
 
 	// pass 1: collect the base tables and join operators
-	ExtractOperatorsRecursive(plan, join_ops);
+	Value setting;
+	const bool deepest_only = context.TryGetCurrentSetting("robust_deepest_join", setting) && setting.GetValue<bool>();
+	JoinOutputCandidate selected;
+	excluded_join_conditions.clear();
+	if (deepest_only) {
+		FindDeepestJoinOutput(plan, 0, selected, excluded_join_conditions);
+	}
+	ExtractOperatorsRecursive(plan, join_ops, deepest_only ? &selected : nullptr);
 
 	// debug: print summary of registered nodes
 	D_PRINT("\n=== REGISTERED NODES SUMMARY ===");
@@ -47,13 +142,23 @@ vector<JoinEdge> RobustOptimizerContextState::ExtractOperators(LogicalOperator &
 	return CreateJoinEdges(join_ops);
 }
 
-void RobustOptimizerContextState::ExtractOperatorsRecursive(LogicalOperator &plan,
-                                                            vector<LogicalOperator *> &join_ops) {
+void RobustOptimizerContextState::ExtractOperatorsRecursive(LogicalOperator &plan, vector<LogicalOperator *> &join_ops,
+                                                            const JoinOutputCandidate *selection) {
 	LogicalOperator *op = &plan;
+	if (selection ? selection->op == op : IsJoinOutputNode(plan)) {
+		auto id = binder.GenerateTableIndex();
+		table_mgr.AddTable({id.index, op, plan.estimated_cardinality, true});
+		auto bindings = plan.GetColumnBindings();
+		for (idx_t i = 0; i < bindings.size(); i++) {
+			rename_col_bindings.emplace(bindings[i], ColumnBinding(id, ProjectionIndex(i)));
+		}
+		return;
+	}
 
 	// step 1: collect all join operators
-	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
-	    op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+	if ((op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+	     op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) &&
+	    !excluded_join_conditions.count(op)) {
 		LogicalComparisonJoin &join = op->Cast<LogicalComparisonJoin>();
 		switch (join.join_type) {
 		case JoinType::INNER:
@@ -109,14 +214,14 @@ void RobustOptimizerContextState::ExtractOperatorsRecursive(LogicalOperator &pla
 			return;
 		}
 
-		ExtractOperatorsRecursive(*child, join_ops);
+		ExtractOperatorsRecursive(*child, join_ops, selection);
 		return;
 	}
 	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
 		auto &agg = op->Cast<LogicalAggregate>();
 		if (agg.groups.empty() && agg.grouping_sets.size() <= 1) {
 			table_mgr.AddTableOperator(op);
-			ExtractOperatorsRecursive(*op->children[0], join_ops);
+			ExtractOperatorsRecursive(*op->children[0], join_ops, selection);
 		} else {
 			auto old_refs = agg.GetColumnBindings();
 			for (size_t i = 0; i < agg.groups.size(); i++) {
@@ -125,7 +230,7 @@ void RobustOptimizerContextState::ExtractOperatorsRecursive(LogicalOperator &pla
 					rename_col_bindings.insert({old_refs[i], col_ref.Binding()});
 				}
 			}
-			ExtractOperatorsRecursive(*op->children[0], join_ops);
+			ExtractOperatorsRecursive(*op->children[0], join_ops, selection);
 		}
 		return;
 	}
@@ -149,20 +254,20 @@ void RobustOptimizerContextState::ExtractOperatorsRecursive(LogicalOperator &pla
 				}
 			}
 		}
-		ExtractOperatorsRecursive(*op->children[0], join_ops);
+		ExtractOperatorsRecursive(*op->children[0], join_ops, selection);
 		return;
 	}
 	case LogicalOperatorType::LOGICAL_UNION:
 	case LogicalOperatorType::LOGICAL_EXCEPT:
 	case LogicalOperatorType::LOGICAL_INTERSECT: {
 		table_mgr.AddTableOperator(op);
-		ExtractOperatorsRecursive(*op->children[0], join_ops);
-		ExtractOperatorsRecursive(*op->children[1], join_ops);
+		ExtractOperatorsRecursive(*op->children[0], join_ops, selection);
+		ExtractOperatorsRecursive(*op->children[1], join_ops, selection);
 		return;
 	}
 	case LogicalOperatorType::LOGICAL_WINDOW: {
 		table_mgr.AddTableOperator(op);
-		ExtractOperatorsRecursive(*op->children[0], join_ops);
+		ExtractOperatorsRecursive(*op->children[0], join_ops, selection);
 		return;
 	}
 	case LogicalOperatorType::LOGICAL_CTE_REF: {
@@ -179,7 +284,7 @@ void RobustOptimizerContextState::ExtractOperatorsRecursive(LogicalOperator &pla
 		return;
 	default:
 		for (auto &child : op->children) {
-			ExtractOperatorsRecursive(*child, join_ops);
+			ExtractOperatorsRecursive(*child, join_ops, selection);
 		}
 	}
 }
@@ -691,7 +796,7 @@ static void PhysicalDAGDFS(LogicalOperator *op, TableManager &table_mgr, RobustO
 		     op->type == LogicalOperatorType::LOGICAL_DELIM_GET ||
 		     op->type == LogicalOperatorType::LOGICAL_EMPTY_RESULT ||
 		     op->type == LogicalOperatorType::LOGICAL_CHUNK_GET || op->type == LogicalOperatorType::LOGICAL_CTE_REF);
-		if (is_leaf) {
+		if (is_leaf || (info->is_join_output && info->table_op == op)) {
 			auto *node = new PhysicalDAGNode(info->table_idx, info->table_op);
 			all_nodes.push_back(node);
 			node_map[info->table_idx] = node;
@@ -716,6 +821,9 @@ static void PhysicalDAGDFS(LogicalOperator *op, TableManager &table_mgr, RobustO
 		PhysicalDAGDFS(op->children[1].get(), table_mgr, state, all_nodes, node_map, dfs_index, uf_parent, raw_conds);
 		PhysicalDAGDFS(op->children[0].get(), table_mgr, state, all_nodes, node_map, dfs_index, uf_parent, raw_conds);
 
+		if (state.excluded_join_conditions.count(op)) {
+			return;
+		}
 		// process each join condition
 		for (const JoinCondition &cond : join.conditions) {
 			if (!cond.IsComparison() || cond.GetComparisonType() != ExpressionType::COMPARE_EQUAL) {
@@ -1401,12 +1509,20 @@ RobustOptimizerContextState::BuildStackedBFOperators(unique_ptr<LogicalOperator>
 	// build operators from merged list
 	unique_ptr<LogicalOperator> current = std::move(base_plan);
 
-	// helper to set estimated_cardinality from the underlying scan table
-	auto set_cardinality = [&](LogicalOperator *op, const FilterOperation &filter_op) {
+	auto configure_filter = [&](auto &op) {
+		auto &filter_op = op.filter_operation;
 		idx_t table_idx = filter_op.is_create ? filter_op.build_table_idx : filter_op.probe_table_idx;
 		auto it = table_mgr.table_lookup.find(table_idx);
 		if (it != table_mgr.table_lookup.end()) {
-			op->estimated_cardinality = it->second.estimated_cardinality;
+			op.estimated_cardinality = it->second.estimated_cardinality;
+			if (it->second.is_join_output) {
+				filter_op.builds_on_join_output = filter_op.is_create;
+				// Graph columns are positions in the join output.
+				const auto output_bindings = it->second.table_op->GetColumnBindings();
+				for (auto &binding : op.input_bindings) {
+					binding = output_bindings.at(binding.column_index);
+				}
+			}
 		}
 	};
 
@@ -1418,12 +1534,14 @@ RobustOptimizerContextState::BuildStackedBFOperators(unique_ptr<LogicalOperator>
 			if (filter_op.is_create) {
 				auto create = make_uniq<LogicalCreateFilter>(filter_op);
 				create->is_forward_pass = filter_op.is_forward_pass;
+				configure_filter(*create);
 				new_op = std::move(create);
 			} else {
-				new_op = make_uniq<LogicalProbeFilter>(filter_op);
+				auto probe = make_uniq<LogicalProbeFilter>(filter_op);
+				configure_filter(*probe);
+				new_op = std::move(probe);
 			}
 
-			set_cardinality(new_op.get(), filter_op);
 			new_op->AddChild(std::move(current));
 			current = std::move(new_op);
 		}
@@ -1434,12 +1552,14 @@ RobustOptimizerContextState::BuildStackedBFOperators(unique_ptr<LogicalOperator>
 			if (filter_op.is_create) {
 				auto create = make_uniq<LogicalCreateFilter>(filter_op);
 				create->is_forward_pass = filter_op.is_forward_pass;
+				configure_filter(*create);
 				new_op = std::move(create);
 			} else {
-				new_op = make_uniq<LogicalProbeFilter>(filter_op);
+				auto probe = make_uniq<LogicalProbeFilter>(filter_op);
+				configure_filter(*probe);
+				new_op = std::move(probe);
 			}
 
-			set_cardinality(new_op.get(), filter_op);
 			new_op->AddChild(std::move(current));
 			current = std::move(new_op);
 		}
@@ -1632,6 +1752,10 @@ void RobustOptimizerContextState::SetupDynamicFilterPushdown(LogicalOperator *pl
 				continue;
 			}
 
+			if (it->second.is_join_output) {
+				// Probe this result with PROBE_FILTER. A scan below the join sees different rows and bindings.
+				continue;
+			}
 			LogicalGet *get = TableManager::FindLogicalGet(it->second.table_op);
 			if (!get) {
 				continue;
@@ -2003,7 +2127,7 @@ unique_ptr<LogicalOperator> RobustOptimizerContextState::Optimize(unique_ptr<Log
 
 void RobustOptimizerContextState::PreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
 	auto optimizer_state = input.context.registered_state->GetOrCreate<RobustOptimizerContextState>(
-	    "robust_optimizer_state", input.context);
+	    "robust_optimizer_state", input.context, input.optimizer.binder);
 
 	plan = optimizer_state->PreOptimize(std::move(plan));
 }
@@ -2013,7 +2137,7 @@ void RobustOptimizerContextState::Optimize(OptimizerExtensionInput &input, uniqu
 	auto opt_start = std::chrono::high_resolution_clock::now();
 
 	const auto optimizer_state = input.context.registered_state->GetOrCreate<RobustOptimizerContextState>(
-	    "robust_optimizer_state", input.context);
+	    "robust_optimizer_state", input.context, input.optimizer.binder);
 	plan = optimizer_state->Optimize(std::move(plan));
 
 	if (profiling) {

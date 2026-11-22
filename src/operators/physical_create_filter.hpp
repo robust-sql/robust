@@ -80,7 +80,8 @@ public:
 	unordered_map<ColumnBinding, shared_ptr<PTBloomFilter>, ColumnBindingHash, ColumnBindingEqual> bloom_filter_map;
 
 	// pipeline reference
-	shared_ptr<Pipeline> this_pipeline;
+	weak_ptr<Pipeline> build_pipeline;
+	vector<weak_ptr<Pipeline>> pending_probes;
 
 	// lookup bloom filter by the column it was built on
 	shared_ptr<PTBloomFilter> GetBloomFilter(const ColumnBinding &col) const;

@@ -36,9 +36,16 @@ static const char *GetOpTypeName(LogicalOperatorType type) {
 void TableManager::AddTable(const TableInfo &table) {
 	table_lookup[table.table_idx] = table;
 	table_ops.push_back(table);
+	if (table.is_join_output) {
+		join_outputs.emplace(table.table_op, table.table_idx);
+	}
 }
 
 idx_t TableManager::GetScalarTableIndex(LogicalOperator *op) {
+	auto output = join_outputs.find(op);
+	if (output != join_outputs.end()) {
+		return output->second;
+	}
 	switch (op->type) {
 	case LogicalOperatorType::LOGICAL_WINDOW:
 	case LogicalOperatorType::LOGICAL_CHUNK_GET:
@@ -113,6 +120,9 @@ string TableManager::GetTableName(idx_t table_idx) {
 	if (it == table_lookup.end()) {
 		return "table_" + std::to_string(table_idx);
 	}
+	if (it->second.is_join_output) {
+		return "join_output_" + to_string(table_idx);
+	}
 	auto *get = FindLogicalGet(it->second.table_op);
 	if (get) {
 		auto table = get->GetTable();
@@ -127,6 +137,9 @@ string TableManager::GetColumnName(idx_t table_idx, idx_t column_index) {
 	auto it = table_lookup.find(table_idx);
 	if (it == table_lookup.end()) {
 		return "col_" + std::to_string(column_index);
+	}
+	if (it->second.is_join_output) {
+		return it->second.table_op->GetColumnBindings().at(column_index).ToString();
 	}
 	auto *get = FindLogicalGet(it->second.table_op);
 	if (!get) {

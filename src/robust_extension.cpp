@@ -62,6 +62,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          Value::BOOLEAN(false));
 	config.AddExtensionOption("robust_filter_type", "Filter type for scan pushdown: all, bf_only, minmax_only",
 	                          LogicalType::VARCHAR, Value("all"));
+	config.AddExtensionOption("robust_deepest_join",
+	                          "Use the deepest eligible join output also as a predicate transfer node",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	config.AddExtensionOption("robust_pass_mode", "Pass mode: both, forward_only", LogicalType::VARCHAR, Value("both"));
 	config.AddExtensionOption("robust_heuristic", "Heuristic for BF transfer: join_order (default), largest_root",
 	                          LogicalType::VARCHAR, Value("join_order"));

@@ -409,16 +409,19 @@ void RemoveRedundantPairs(RobustOptimizerContextState &state, vector<FilterOpPai
 		const auto &pair_op = pair.probe_op;
 		auto &build_state = table_states[pair_op.build_table_idx];
 		auto &probe_state = table_states[pair_op.probe_table_idx];
+		const bool join_output = state.table_mgr.table_lookup.at(pair_op.build_table_idx).is_join_output ||
+		                         state.table_mgr.table_lookup.at(pair_op.probe_table_idx).is_join_output;
 		bool redundant = false;
 
-		if (build_state.status == IncomingFilterStatus::NONE && !HasFilteringLocalPredicate(state, pair) &&
-		    IsRedundant(state, pair)) {
+		if (!join_output && build_state.status == IncomingFilterStatus::NONE &&
+		    !HasFilteringLocalPredicate(state, pair) && IsRedundant(state, pair)) {
 			redundant = true;
 		}
 
 		// peel from turnaround
-		if (build_state.status == IncomingFilterStatus::ONE && build_state.source_idx == pair_op.probe_table_idx &&
-		    !HasFilteringLocalPredicate(state, pair) && IsRedundant(state, pair)) {
+		if (!join_output && build_state.status == IncomingFilterStatus::ONE &&
+		    build_state.source_idx == pair_op.probe_table_idx && !HasFilteringLocalPredicate(state, pair) &&
+		    IsRedundant(state, pair)) {
 			redundant = true;
 		}
 

@@ -762,11 +762,19 @@ void PhysicalCreateFilter::BuildPipelines(Pipeline &current, MetaPipeline &meta_
 	// make this operator source of the pipeline
 	state.SetPipelineSource(current, *this);
 
-	if (this_pipeline == nullptr) {
+	auto this_pipeline = build_pipeline.lock();
+	if (!this_pipeline) {
 		// D_PRINTF("[PIPELINE] CREATE_FILTER (build=%s) creating NEW child pipeline for build-side",
 		// build_table.c_str());
 		auto &child_meta_pipeline = meta_pipeline.CreateChildMetaPipeline(current, *this);
 		this_pipeline = child_meta_pipeline.GetBasePipeline();
+		build_pipeline = this_pipeline;
+		for (auto &pending : pending_probes) {
+			if (auto probe = pending.lock()) {
+				probe->AddDependency(this_pipeline);
+			}
+		}
+		pending_probes.clear();
 		// CreateChildMetaPipeline() automatically registers the child pipeline as a dependency
 		child_meta_pipeline.Build(children[0].get());
 		// D_PRINTF("[PIPELINE] CREATE_FILTER (build=%s) child pipeline created", build_table.c_str());
@@ -791,10 +799,18 @@ void PhysicalCreateFilter::BuildPipelinesFromRelated(Pipeline &current, MetaPipe
 	    build_table.c_str(), ptr_str));
 #endif
 
-	if (this_pipeline == nullptr) {
+	auto this_pipeline = build_pipeline.lock();
+	if (!this_pipeline && filter_operation->builds_on_join_output) {
+		// The output may consume a CTE or delim scan. Its owner registers those
+		// dependencies during native traversal. Link the probe when we get there.
+		pending_probes.emplace_back(current.shared_from_this());
+		return;
+	}
+	if (!this_pipeline) {
 		D_PRINTF("[PIPELINE] CREATE_FILTER creating NEW child pipeline from BuildPipelinesFromRelated");
 		auto &child_meta_pipeline = meta_pipeline.CreateChildMetaPipeline(current, *this);
 		this_pipeline = child_meta_pipeline.GetBasePipeline();
+		build_pipeline = this_pipeline;
 		child_meta_pipeline.Build(children[0].get());
 		D_PRINT("[PIPELINE] CREATE_FILTER child pipeline created and dependency added automatically");
 	} else {
