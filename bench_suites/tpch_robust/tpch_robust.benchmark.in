@@ -17,7 +17,6 @@ subgroup sf${sf}
 
 init
 LOAD 'build/release/extension/robust/robust.duckdb_extension';
-SET disabled_optimizers = 'join_filter_pushdown';
 SET robust_heuristic = 'join_order';
 
 run tpchdata/queries/q${QUERY_NUMBER_PADDED}.sql

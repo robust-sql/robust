@@ -6,6 +6,9 @@
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/optimizer/join_filter_pushdown_optimizer.hpp"
+#include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/common/types.hpp"
 #include "table_manager.hpp"
 #include "graph_manager.hpp"
@@ -61,9 +64,9 @@ void RobustOptimizerContextState::ExtractOperatorsRecursive(LogicalOperator &pla
 		case JoinType::SEMI:
 		case JoinType::RIGHT_SEMI: {
 			if (std::any_of(join.conditions.begin(), join.conditions.end(), [](const JoinCondition &jc) {
-				    return jc.comparison == ExpressionType::COMPARE_EQUAL &&
-				           jc.left->type == ExpressionType::BOUND_COLUMN_REF &&
-				           jc.right->type == ExpressionType::BOUND_COLUMN_REF;
+				    return jc.IsComparison() && jc.GetComparisonType() == ExpressionType::COMPARE_EQUAL &&
+				           jc.GetLHS().GetExpressionType() == ExpressionType::BOUND_COLUMN_REF &&
+				           jc.GetRHS().GetExpressionType() == ExpressionType::BOUND_COLUMN_REF;
 			    })) {
 				// JoinEdge edge(join);
 				join_ops.push_back(op);
@@ -98,7 +101,7 @@ void RobustOptimizerContextState::ExtractOperatorsRecursive(LogicalOperator &pla
 				current = current->children[0].get();
 			}
 			if (current->type == LogicalOperatorType::LOGICAL_GET) {
-				auto table_idx = current->Cast<LogicalGet>().table_index;
+				auto table_idx = current->Cast<LogicalGet>().table_index.index;
 				table_with_filters.insert(table_idx);
 			}
 		}
@@ -119,9 +122,9 @@ void RobustOptimizerContextState::ExtractOperatorsRecursive(LogicalOperator &pla
 		} else {
 			auto old_refs = agg.GetColumnBindings();
 			for (size_t i = 0; i < agg.groups.size(); i++) {
-				if (agg.groups[i]->type == ExpressionType::BOUND_COLUMN_REF) {
+				if (agg.groups[i]->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
 					auto &col_ref = agg.groups[i]->Cast<BoundColumnRefExpression>();
-					rename_col_bindings.insert({old_refs[i], col_ref.binding});
+					rename_col_bindings.insert({old_refs[i], col_ref.Binding()});
 				}
 			}
 			ExtractOperatorsRecursive(*op->children[0], join_ops);
@@ -131,15 +134,19 @@ void RobustOptimizerContextState::ExtractOperatorsRecursive(LogicalOperator &pla
 	case LogicalOperatorType::LOGICAL_PROJECTION: {
 		auto old_refs = op->GetColumnBindings();
 		for (size_t i = 0; i < op->expressions.size(); i++) {
-			if (op->expressions[i]->type == ExpressionType::BOUND_COLUMN_REF) {
+			if (op->expressions[i]->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
 				auto &col_ref = op->expressions[i]->Cast<BoundColumnRefExpression>();
-				rename_col_bindings.insert({old_refs[i], col_ref.binding});
-			} else if (op->expressions[i]->type == ExpressionType::BOUND_FUNCTION) {
+				rename_col_bindings.insert({old_refs[i], col_ref.Binding()});
+			} else if (op->expressions[i]->GetExpressionType() == ExpressionType::BOUND_FUNCTION ||
+			           (BoundCastExpression::IsCast(*op->expressions[i]) &&
+			            BoundCastExpression::SourceType(op->expressions[i]->Cast<BoundFunctionExpression>())
+			                .IsIntegral() &&
+			            op->expressions[i]->GetReturnType().IsIntegral())) {
 				auto &func_ref = op->expressions[i]->Cast<BoundFunctionExpression>();
-				for (const auto &arg : func_ref.children) {
-					if (arg->type == ExpressionType::BOUND_COLUMN_REF) {
+				for (const auto &arg : func_ref.GetChildren()) {
+					if (arg->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
 						auto &col_ref = arg->Cast<BoundColumnRefExpression>();
-						rename_col_bindings.insert({old_refs[i], col_ref.binding});
+						rename_col_bindings.insert({old_refs[i], col_ref.Binding()});
 					}
 				}
 			}
@@ -160,13 +167,15 @@ void RobustOptimizerContextState::ExtractOperatorsRecursive(LogicalOperator &pla
 		ExtractOperatorsRecursive(*op->children[0], join_ops);
 		return;
 	}
+	case LogicalOperatorType::LOGICAL_CTE_REF: {
+		return;
+	}
 	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
 	case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
 	case LogicalOperatorType::LOGICAL_DELIM_GET:
 	case LogicalOperatorType::LOGICAL_GET:
 	case LogicalOperatorType::LOGICAL_EMPTY_RESULT:
 	case LogicalOperatorType::LOGICAL_CHUNK_GET:
-	case LogicalOperatorType::LOGICAL_CTE_REF:
 		D_PRINTF("[NODE_REG] Registering base table scan, type=%d", (int)op->type);
 		table_mgr.AddTableOperator(op);
 		return;
@@ -183,10 +192,10 @@ ColumnBinding RobustOptimizerContextState::ResolveColumnBinding(const ColumnBind
 
 	// follow the rename chain until we find a base table binding
 	while (true) {
-		auto key = make_pair(current.table_index, current.column_index);
+		auto key = make_pair(current.table_index.index, current.column_index);
 		if (visited.count(key)) {
 			D_PRINTF("WARNING: Cycle detected in rename_col_bindings for binding (%llu.%llu)",
-			         (unsigned long long)current.table_index, (unsigned long long)current.column_index);
+			         (unsigned long long)current.table_index.index, (unsigned long long)current.column_index);
 			break;
 		}
 		visited.insert(key);
@@ -223,6 +232,22 @@ static void TableUFUnion(unordered_map<idx_t, idx_t> &parent, idx_t a, idx_t b) 
 	}
 }
 
+// DuckDB counts null-safe and expression equalities toward the single-key limit.
+static PRFProbeSides GetPRFProbeSides(const LogicalComparisonJoin &join) {
+	const auto equalities =
+	    std::count_if(join.conditions.begin(), join.conditions.end(), [](const JoinCondition &condition) {
+		    return condition.IsComparison() &&
+		           (condition.GetComparisonType() == ExpressionType::COMPARE_EQUAL ||
+		            condition.GetComparisonType() == ExpressionType::COMPARE_NOT_DISTINCT_FROM);
+	    });
+	if (equalities != 1) {
+		return {false, false};
+	}
+	return {JoinFilterPushdownUtil::JoinTypeIsSupported(join.join_type),
+	        HasInverseJoinType(join.join_type) &&
+	            JoinFilterPushdownUtil::JoinTypeIsSupported(InverseJoinType(join.join_type))};
+}
+
 vector<JoinEdge> RobustOptimizerContextState::CreateJoinEdges(vector<LogicalOperator *> &join_ops) {
 	vector<JoinEdge> edges;
 	unordered_map<idx_t, idx_t> table_parent;
@@ -234,12 +259,12 @@ vector<JoinEdge> RobustOptimizerContextState::CreateJoinEdges(vector<LogicalOper
 		vector<ColumnBinding> resolved_left_columns, resolved_right_columns;
 
 		for (const JoinCondition &cond : join.conditions) {
-			if (cond.comparison == ExpressionType::COMPARE_EQUAL &&
-			    cond.left->type == ExpressionType::BOUND_COLUMN_REF &&
-			    cond.right->type == ExpressionType::BOUND_COLUMN_REF) {
+			if (cond.IsComparison() && cond.GetComparisonType() == ExpressionType::COMPARE_EQUAL &&
+			    cond.GetLHS().GetExpressionType() == ExpressionType::BOUND_COLUMN_REF &&
+			    cond.GetRHS().GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
 				// store original bindings
-				ColumnBinding left_binding = cond.left->Cast<BoundColumnRefExpression>().binding;
-				ColumnBinding right_binding = cond.right->Cast<BoundColumnRefExpression>().binding;
+				ColumnBinding left_binding = cond.GetLHS().Cast<BoundColumnRefExpression>().Binding();
+				ColumnBinding right_binding = cond.GetRHS().Cast<BoundColumnRefExpression>().Binding();
 
 				left_columns.push_back(left_binding);
 				right_columns.push_back(right_binding);
@@ -252,8 +277,8 @@ vector<JoinEdge> RobustOptimizerContextState::CreateJoinEdges(vector<LogicalOper
 
 		if (!left_columns.empty() && !right_columns.empty()) {
 			// get table indices from first resolved column
-			idx_t left_table_idx = resolved_left_columns[0].table_index;
-			idx_t right_table_idx = resolved_right_columns[0].table_index;
+			idx_t left_table_idx = resolved_left_columns[0].table_index.index;
+			idx_t right_table_idx = resolved_right_columns[0].table_index.index;
 
 			// verify these table indices exist in our table manager
 			if (table_mgr.table_lookup.find(left_table_idx) != table_mgr.table_lookup.end() &&
@@ -261,6 +286,7 @@ vector<JoinEdge> RobustOptimizerContextState::CreateJoinEdges(vector<LogicalOper
 				// use resolved column bindings in the JoinEdge so they match child bindings in CreatePlan
 				JoinEdge edge(left_table_idx, right_table_idx, resolved_left_columns, resolved_right_columns,
 				              resolved_left_columns.size(), join.join_type);
+				edge.prf_probe_sides = GetPRFProbeSides(join);
 				edges.push_back(edge);
 			} else {
 				D_PRINTF("WARNING: Resolved table indices (%llu, %llu) not found in table_lookup",
@@ -270,8 +296,8 @@ vector<JoinEdge> RobustOptimizerContextState::CreateJoinEdges(vector<LogicalOper
 			// record whether the join graph is cyclic without short-circuiting, so the
 			// returned edge list stays complete regardless of where a cycle shows up
 			for (idx_t i = 0; i < resolved_left_columns.size(); i++) {
-				auto u = resolved_left_columns[i].table_index;
-				auto v = resolved_right_columns[i].table_index;
+				auto u = resolved_left_columns[i].table_index.index;
+				auto v = resolved_right_columns[i].table_index.index;
 				if (u > v) {
 					std::swap(u, v);
 				}
@@ -485,13 +511,13 @@ void RobustOptimizerContextState::DebugPrintGraph(const vector<JoinEdge> &edges)
 		// Print column bindings
 		string cols_a = "  Columns A: ";
 		for (const auto &col : edge.join_columns_a) {
-			cols_a += "(" + std::to_string(col.table_index) + "." + std::to_string(col.column_index) + ") ";
+			cols_a += "(" + std::to_string(col.table_index.index) + "." + std::to_string(col.column_index) + ") ";
 		}
 		Printer::Print(cols_a);
 
 		string cols_b = "  Columns B: ";
 		for (const auto &col : edge.join_columns_b) {
-			cols_b += "(" + std::to_string(col.table_index) + "." + std::to_string(col.column_index) + ") ";
+			cols_b += "(" + std::to_string(col.table_index.index) + "." + std::to_string(col.column_index) + ") ";
 		}
 		Printer::Print(cols_b);
 	}
@@ -522,7 +548,7 @@ void RobustOptimizerContextState::DebugPrintMST(const vector<JoinEdge> &mst_edge
 			                (unsigned long long)filter_op.build_table_idx);
 			string cols = "  Build columns: ";
 			for (const auto &col : filter_op.build_columns) {
-				cols += "(" + std::to_string(col.table_index) + "." + std::to_string(col.column_index) + ") ";
+				cols += "(" + std::to_string(col.table_index.index) + "." + std::to_string(col.column_index) + ") ";
 			}
 			Printer::Print(cols);
 		} else {
@@ -532,13 +558,15 @@ void RobustOptimizerContextState::DebugPrintMST(const vector<JoinEdge> &mst_edge
 			                (unsigned long long)filter_op.build_table_idx);
 			string build_cols = "  Build columns: ";
 			for (const auto &col : filter_op.build_columns) {
-				build_cols += "(" + std::to_string(col.table_index) + "." + std::to_string(col.column_index) + ") ";
+				build_cols +=
+				    "(" + std::to_string(col.table_index.index) + "." + std::to_string(col.column_index) + ") ";
 			}
 			Printer::Print(build_cols);
 
 			string probe_cols = "  Probe columns: ";
 			for (const auto &col : filter_op.probe_columns) {
-				probe_cols += "(" + std::to_string(col.table_index) + "." + std::to_string(col.column_index) + ") ";
+				probe_cols +=
+				    "(" + std::to_string(col.table_index.index) + "." + std::to_string(col.column_index) + ") ";
 			}
 			Printer::Print(probe_cols);
 		}
@@ -592,9 +620,12 @@ static void UFUnion(map<ColKey, ColKey> &parent, ColKey a, ColKey b) {
 
 // add a child->parent edge, or merge columns into an existing edge (multi-column join)
 static void AddOrMergeDAGEdge(PhysicalDAGNode *parent_node, PhysicalDAGNode *child_node,
-                              const ColumnBinding &parent_col, const ColumnBinding &child_col) {
+                              const ColumnBinding &parent_col, const ColumnBinding &child_col,
+                              PRFProbeSides prf_sides) {
 	for (auto &edge : child_node->edges_to_parents) {
 		if (edge.parent_table == parent_node->table_idx) {
+			edge.prf_probe_sides.first &= prf_sides.first;
+			edge.prf_probe_sides.second &= prf_sides.second;
 			// multi-column join: append columns, skipping exact duplicates
 			for (idx_t i = 0; i < edge.parent_cols.size(); i++) {
 				if (edge.parent_cols[i] == parent_col && edge.child_cols[i] == child_col) {
@@ -603,6 +634,7 @@ static void AddOrMergeDAGEdge(PhysicalDAGNode *parent_node, PhysicalDAGNode *chi
 			}
 			edge.parent_cols.push_back(parent_col);
 			edge.child_cols.push_back(child_col);
+			edge.prf_probe_sides = {false, false};
 			return;
 		}
 	}
@@ -610,6 +642,7 @@ static void AddOrMergeDAGEdge(PhysicalDAGNode *parent_node, PhysicalDAGNode *chi
 	parent_node->children.push_back(child_node);
 
 	PhysicalDAGEdge edge;
+	edge.prf_probe_sides = prf_sides;
 	edge.parent_table = parent_node->table_idx;
 	edge.child_table = child_node->table_idx;
 	edge.parent_cols.push_back(parent_col);
@@ -651,10 +684,11 @@ static void RecomputeDAGLevels(vector<PhysicalDAGNode *> &all_nodes) {
 
 // raw equality condition captured during DFS, before equivalence rerouting.
 // used afterwards to reconnect tables the rerouting left without any edge.
-// table indices are derivable as col_a/col_b .table_index
+// table indices are derivable as col_a/col_b .table_index.index
 struct RawDAGCond {
 	ColumnBinding col_a;
 	ColumnBinding col_b;
+	PRFProbeSides prf_sides;
 };
 
 // dfs_index lookup with a defensive default for unregistered tables
@@ -707,28 +741,29 @@ static void PhysicalDAGDFS(LogicalOperator *op, TableManager &table_mgr, RobustO
 		PhysicalDAGDFS(op->children[1].get(), table_mgr, state, all_nodes, node_map, dfs_index, uf_parent, raw_conds);
 		PhysicalDAGDFS(op->children[0].get(), table_mgr, state, all_nodes, node_map, dfs_index, uf_parent, raw_conds);
 
+		const auto prf_sides = GetPRFProbeSides(join);
 		// process each join condition
 		for (const JoinCondition &cond : join.conditions) {
-			if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
+			if (!cond.IsComparison() || cond.GetComparisonType() != ExpressionType::COMPARE_EQUAL) {
 				continue;
 			}
-			if (cond.left->type != ExpressionType::BOUND_COLUMN_REF ||
-			    cond.right->type != ExpressionType::BOUND_COLUMN_REF) {
+			if (cond.GetLHS().GetExpressionType() != ExpressionType::BOUND_COLUMN_REF ||
+			    cond.GetRHS().GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 				continue;
 			}
 
 			ColumnBinding left_resolved =
-			    state.ResolveColumnBinding(cond.left->Cast<BoundColumnRefExpression>().binding);
+			    state.ResolveColumnBinding(cond.GetLHS().Cast<BoundColumnRefExpression>().Binding());
 			ColumnBinding right_resolved =
-			    state.ResolveColumnBinding(cond.right->Cast<BoundColumnRefExpression>().binding);
+			    state.ResolveColumnBinding(cond.GetRHS().Cast<BoundColumnRefExpression>().Binding());
 
 			// add to equivalence classes
-			ColKey left_key = {left_resolved.table_index, left_resolved.column_index};
-			ColKey right_key = {right_resolved.table_index, right_resolved.column_index};
+			ColKey left_key = {left_resolved.table_index.index, left_resolved.column_index};
+			ColKey right_key = {right_resolved.table_index.index, right_resolved.column_index};
 			UFUnion(uf_parent, left_key, right_key);
 
-			idx_t table_a = left_resolved.table_index;
-			idx_t table_b = right_resolved.table_index;
+			idx_t table_a = left_resolved.table_index.index;
+			idx_t table_b = right_resolved.table_index.index;
 			if (!node_map.count(table_a) || !node_map.count(table_b)) {
 				continue;
 			}
@@ -761,11 +796,11 @@ static void PhysicalDAGDFS(LogicalOperator *op, TableManager &table_mgr, RobustO
 			// must stay below the node_map checks above: the orphan post-pass relies
 			// on every recorded condition having produced a parent-side edge, which
 			// guarantees reconnection always attaches to the main DAG (no islands)
-			raw_conds.push_back({left_resolved, right_resolved});
+			raw_conds.push_back({left_resolved, right_resolved, prf_sides});
 
 			// equiv resolution on child side: find shallowest equivalent (highest DFS, != parent)
 			// this chains edges along execution order within an equivalence class
-			ColKey child_root = UFFind(uf_parent, {child_col.table_index, child_col.column_index});
+			ColKey child_root = UFFind(uf_parent, {child_col.table_index.index, child_col.column_index});
 			idx_t best_child = child_idx;
 			int best_child_dfs = child_dfs;
 			ColumnBinding best_child_col = child_col;
@@ -788,11 +823,12 @@ static void PhysicalDAGDFS(LogicalOperator *op, TableManager &table_mgr, RobustO
 				if (candidate_dfs > best_child_dfs) {
 					best_child = candidate;
 					best_child_dfs = candidate_dfs;
-					best_child_col = ColumnBinding(key.first, key.second);
+					best_child_col = ColumnBinding(TableIndex(key.first), ProjectionIndex(key.second));
 				}
 			}
 
-			AddOrMergeDAGEdge(node_map[parent_idx], node_map[best_child], parent_col, best_child_col);
+			AddOrMergeDAGEdge(node_map[parent_idx], node_map[best_child], parent_col, best_child_col,
+			                  parent_idx == table_a ? prf_sides : prf_sides.Reversed());
 		}
 		return;
 	}
@@ -823,20 +859,21 @@ vector<PhysicalDAGNode *> RobustOptimizerContextState::BuildPhysicalPlanDAG(Logi
 		bool found = false;
 		int best_dfs = -1;
 		idx_t best_other = 0;
+		PRFProbeSides prf_sides {false, false};
 		ColumnBinding best_node_col, best_other_col;
 		for (auto &rc : raw_conds) {
 			// normalize so node_col is always this node's side
 			ColumnBinding node_col, other_col;
-			if (rc.col_a.table_index == node->table_idx) {
+			if (rc.col_a.table_index.index == node->table_idx) {
 				node_col = rc.col_a;
 				other_col = rc.col_b;
-			} else if (rc.col_b.table_index == node->table_idx) {
+			} else if (rc.col_b.table_index.index == node->table_idx) {
 				node_col = rc.col_b;
 				other_col = rc.col_a;
 			} else {
 				continue;
 			}
-			idx_t other = other_col.table_index;
+			idx_t other = other_col.table_index.index;
 			if (!node_map.count(other)) {
 				continue;
 			}
@@ -847,15 +884,16 @@ vector<PhysicalDAGNode *> RobustOptimizerContextState::BuildPhysicalPlanDAG(Logi
 				best_other = other;
 				best_node_col = node_col;
 				best_other_col = other_col;
+				prf_sides = node_col == rc.col_a ? rc.prf_sides : rc.prf_sides.Reversed();
 			}
 		}
 		if (!found) {
 			continue;
 		}
 		if (best_dfs > DFSIndexOf(dfs_index, node->table_idx)) {
-			AddOrMergeDAGEdge(node_map[best_other], node, best_other_col, best_node_col);
+			AddOrMergeDAGEdge(node_map[best_other], node, best_other_col, best_node_col, prf_sides.Reversed());
 		} else {
-			AddOrMergeDAGEdge(node, node_map[best_other], best_node_col, best_other_col);
+			AddOrMergeDAGEdge(node, node_map[best_other], best_node_col, best_other_col, prf_sides);
 		}
 	}
 
@@ -957,6 +995,7 @@ void RobustOptimizerContextState::FlipRootsToLeaves(vector<PhysicalDAGNode *> &a
 					node->parents.push_back(child);
 
 					PhysicalDAGEdge reversed;
+					reversed.prf_probe_sides = edge.prf_probe_sides.Reversed();
 					reversed.parent_table = edge.child_table;
 					reversed.child_table = edge.parent_table;
 					reversed.parent_cols = edge.child_cols;
@@ -1097,6 +1136,8 @@ RobustOptimizerContextState::GenerateStageModifications(const vector<JoinEdge> &
 			use_op.probe_table_idx = parent_node->table_idx;
 			use_op.build_columns = child_columns;
 			use_op.probe_columns = parent_columns;
+			use_op.can_push_prf =
+			    parent_node->table_idx == edge->table_a ? edge->prf_probe_sides.first : edge->prf_probe_sides.second;
 			use_op.is_create = false;
 			use_op.is_forward_pass = true;
 			use_op.sequence_number = sequence++;
@@ -1196,9 +1237,9 @@ RobustOptimizerContextState::GenerateStageModificationsFromDAG(vector<PhysicalDA
 	// 			Printer::Print(StringUtil::Format(
 	// 			    "[DAG-GEN]     edge[%llu] parent=%llu col(%llu.%llu) <- child=%llu col(%llu.%llu)",
 	// 			    (unsigned long long)ei, (unsigned long long)e.parent_table,
-	// 			    (unsigned long long)e.parent_cols[ci].table_index,
+	// 			    (unsigned long long)e.parent_cols[ci].table_index.index,
 	// 			    (unsigned long long)e.parent_cols[ci].column_index, (unsigned long long)e.child_table,
-	// 			    (unsigned long long)e.child_cols[ci].table_index,
+	// 			    (unsigned long long)e.child_cols[ci].table_index.index,
 	// 			    (unsigned long long)e.child_cols[ci].column_index));
 	// 		}
 	// 	}
@@ -1228,6 +1269,7 @@ RobustOptimizerContextState::GenerateStageModificationsFromDAG(vector<PhysicalDA
 				use_op.probe_table_idx = parent_node->table_idx;
 				use_op.build_columns = edge.child_cols;
 				use_op.probe_columns = edge.parent_cols;
+				use_op.can_push_prf = edge.prf_probe_sides.first;
 				use_op.is_create = false;
 				use_op.is_forward_pass = true;
 				use_op.sequence_number = sequence++;
@@ -1269,7 +1311,7 @@ RobustOptimizerContextState::GenerateStageModificationsFromDAG(vector<PhysicalDA
 				auto *parent_node = child_node->parents[ei];
 
 				// determine the equivalence class for this edge using the first column pair
-				ColKey parent_col_key = {edge.parent_cols[0].table_index, edge.parent_cols[0].column_index};
+				ColKey parent_col_key = {edge.parent_cols[0].table_index.index, edge.parent_cols[0].column_index};
 				ColKey equiv_root = UFFind(uf_parent, parent_col_key);
 
 				auto it = equiv_class_bf_source.find(equiv_root);
@@ -1485,7 +1527,7 @@ void RobustOptimizerContextState::LinkProbeFilterToCreateFilter(LogicalOperator 
 				return false;
 			}
 			for (size_t i = 0; i < build_columns.size(); i++) {
-				if (build_columns[i].table_index != other.build_columns[i].table_index ||
+				if (build_columns[i].table_index.index != other.build_columns[i].table_index.index ||
 				    build_columns[i].column_index != other.build_columns[i].column_index) {
 					return false;
 				}
@@ -1498,7 +1540,7 @@ void RobustOptimizerContextState::LinkProbeFilterToCreateFilter(LogicalOperator 
 		size_t operator()(const CreateFilterKey &key) const {
 			size_t hash = std::hash<idx_t>()(key.build_table_idx);
 			for (const auto &col : key.build_columns) {
-				hash ^= (std::hash<idx_t>()(col.table_index) << 1);
+				hash ^= (std::hash<idx_t>()(col.table_index.index) << 1);
 				hash ^= (std::hash<idx_t>()(col.column_index) << 2);
 			}
 			return hash;
@@ -1544,7 +1586,7 @@ void RobustOptimizerContextState::LinkProbeFilterToCreateFilter(LogicalOperator 
 				if (it != create_filter_by_table.end()) {
 					for (auto *create_filter : it->second) {
 						for (const auto &pc : create_filter->filter_operation.probe_columns) {
-							if (pc.table_index == probe_table_idx) {
+							if (pc.table_index.index == probe_table_idx) {
 								probe_filter->related_create_filter = create_filter;
 								create_filter->related_probe_filter.push_back(probe_filter);
 								break;
@@ -1605,6 +1647,7 @@ void RobustOptimizerContextState::SetupDynamicFilterPushdown(LogicalOperator *pl
 
 	// for each forward-pass CREATE_FILTER, set up pushdown targets
 	for (auto *create_filter : forward_creates) {
+		const bool build_has_filter = JoinFilterPushdownOptimizer::IsFiltering(create_filter->children[0]);
 		D_PRINTF("[PUSHDOWN-SETUP] CREATE_FILTER build=table_%llu, related_probe_filter=%zu",
 		         (unsigned long long)create_filter->filter_operation.build_table_idx,
 		         create_filter->related_probe_filter.size());
@@ -1641,8 +1684,8 @@ void RobustOptimizerContextState::SetupDynamicFilterPushdown(LogicalOperator *pl
 				idx_t scan_col_idx = probe_col.column_index;
 				if (scan_col_idx >= col_ids.size()) {
 					D_PRINTF("[PUSHDOWN] probe column (%llu.%llu) out of bounds for scan column_ids (size=%zu)",
-					         (unsigned long long)probe_col.table_index, (unsigned long long)probe_col.column_index,
-					         col_ids.size());
+					         (unsigned long long)probe_col.table_index.index,
+					         (unsigned long long)probe_col.column_index, col_ids.size());
 					continue;
 				}
 
@@ -1654,15 +1697,23 @@ void RobustOptimizerContextState::SetupDynamicFilterPushdown(LogicalOperator *pl
 					col_type = get->returned_types[primary_idx];
 				}
 				if (primary_idx < get->names.size()) {
-					col_name = get->names[primary_idx];
+					col_name = get->names[primary_idx].GetIdentifierName();
 				}
 
-				LogicalCreateFilter::DynamicFilterTarget target;
+				ScanFilterTarget target;
 				target.dynamic_filters = get->dynamic_filters;
-				target.scan_column_index = scan_col_idx;
-				target.probe_column = probe_col;
+				target.scan_column_index = ProjectionIndex(scan_col_idx);
+				target.build_column = probe_filter->filter_operation.build_columns[i];
 				target.column_type = col_type;
 				target.column_name = col_name;
+				if (probe_filter->filter_operation.can_push_prf && get->function.filter_pushdown &&
+				    probe_col.table_index == get->table_index && primary_idx < get->returned_types.size()) {
+					// Match DuckDB's CanUseBloomFilter cardinality limits.
+					const auto probe_rows = it->second.estimated_cardinality;
+					target.max_prf_build_rows = build_has_filter
+					                                ? MaxValue(probe_rows, get->estimated_cardinality)
+					                                : MinValue(probe_rows, MaxValue<idx_t>(4194304, probe_rows / 10));
+				}
 				create_filter->pushdown_targets.push_back(std::move(target));
 			}
 

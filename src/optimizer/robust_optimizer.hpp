@@ -30,6 +30,7 @@ struct PhysicalDAGEdge {
 	idx_t child_table;
 	vector<ColumnBinding> parent_cols;
 	vector<ColumnBinding> child_cols;
+	PRFProbeSides prf_probe_sides {false, false}; // parent, child
 };
 
 // node in physical plan DAG (supports multiple parents for multi-way joins)
@@ -75,7 +76,7 @@ public:
 	vector<LogicalOperator *> join_ops;
 	vector<JoinEdge> mst_edges;
 
-	unordered_map<ColumnBinding, ColumnBinding, ColumnBindingHashFunction> rename_col_bindings;
+	unordered_map<ColumnBinding, ColumnBinding, ColumnBindingHash> rename_col_bindings;
 
 	unordered_set<idx_t> table_with_filters;
 

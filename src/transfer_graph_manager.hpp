@@ -65,7 +65,7 @@ struct JoinKeyTableGroup {
 
 struct ColumnBindingHashFunc {
 	size_t operator()(const ColumnBinding &key) const {
-		return std::hash<uint64_t> {}(key.table_index) ^ (std::hash<uint64_t> {}(key.column_index) << 1);
+		return std::hash<uint64_t> {}(key.table_index.index) ^ (std::hash<uint64_t> {}(key.column_index) << 1);
 	}
 };
 
