@@ -9,6 +9,8 @@
 #include "duckdb/optimizer/optimizer_extension.hpp"
 
 namespace duckdb {
+class Binder;
+struct JoinOutputCandidate;
 
 // tree node for rooted MST representation (used by Robust DAG)
 struct TreeNode {
@@ -62,10 +64,11 @@ struct LiftableChain {
 
 class RobustOptimizerContextState : public ClientContextState {
 public:
-	explicit RobustOptimizerContextState(ClientContext &ctx) : context(ctx) {
+	RobustOptimizerContextState(ClientContext &ctx, Binder &binder) : context(ctx), binder(binder) {
 	}
 
 	ClientContext &context;
+	Binder &binder;
 
 	vector<JoinEdge> join_edges;
 	//	map<table_id, idx_t> table_cardinalities;
@@ -75,9 +78,10 @@ public:
 	vector<LogicalOperator *> join_ops;
 	vector<JoinEdge> mst_edges;
 
-	unordered_map<ColumnBinding, ColumnBinding, ColumnBindingHashFunction> rename_col_bindings;
+	unordered_map<ColumnBinding, ColumnBinding, ColumnBindingHash> rename_col_bindings;
 
 	unordered_set<idx_t> table_with_filters;
+	unordered_set<LogicalOperator *> excluded_join_conditions;
 
 	bool exist_cycle = false;
 
@@ -85,7 +89,8 @@ public:
 	// extract all the join edges from the plan
 	// vector<JoinEdge> ExtractOperators(LogicalOperator &plan, vector<LogicalOperator*> &join_ops);
 	vector<JoinEdge> ExtractOperators(LogicalOperator &plan);
-	void ExtractOperatorsRecursive(LogicalOperator &plan, vector<LogicalOperator *> &join_ops);
+	void ExtractOperatorsRecursive(LogicalOperator &plan, vector<LogicalOperator *> &join_ops,
+	                               const JoinOutputCandidate *selection);
 	map<table_id, TableInfo> get_value();
 	vector<JoinEdge> CreateJoinEdges(vector<LogicalOperator *> &join_ops);
 	vector<JoinEdge> LargestRoot(vector<JoinEdge> &edges);

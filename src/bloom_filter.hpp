@@ -7,12 +7,13 @@
 //===----------------------------------------------------------------------===//
 #pragma once
 
-#include "duckdb/planner/filter/bloom_filter.hpp"
+#include "duckdb/planner/filter/table_filter_functions.hpp"
 #include "duckdb/planner/column_binding.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 
 #include <cstdint>
+#include <atomic>
 
 namespace duckdb {
 
@@ -46,14 +47,21 @@ public:
 		return !has_data_;
 	}
 
-	BloomFilter &GetNativeFilter() {
+	shared_ptr<const BloomFilter> GetNativeFilter() const {
 		return bf_;
 	}
 
+	void Seal(ClientContext &context) {
+		if (!IsEmpty()) {
+			bf_->Seal(context);
+		}
+		finalized_ = true;
+	}
+
 private:
-	bool has_data_ = false;
+	std::atomic<bool> has_data_ {false};
 	idx_t sized_for_rows_ = 0;
-	BloomFilter bf_;
+	shared_ptr<BloomFilter> bf_ = make_shared_ptr<BloomFilter>();
 };
 
 } // namespace duckdb

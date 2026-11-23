@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb/common/types.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include <map>
@@ -12,6 +13,7 @@ struct TableInfo {
 	table_id table_idx;
 	LogicalOperator *table_op; // LogicalGet, LogicalFilter->LogicalGet, etc.
 	idx_t estimated_cardinality;
+	bool is_join_output = false;
 };
 
 class TableManager {
@@ -35,6 +37,10 @@ public:
 	string GetTableName(idx_t table_idx);
 	// resolve column name from table index and column binding index
 	string GetColumnName(idx_t table_idx, idx_t column_index);
+
+private:
+	// Joins can expose columns from several table indices. Give each output one graph identity.
+	unordered_map<LogicalOperator *, idx_t> join_outputs;
 };
 
 } // namespace duckdb

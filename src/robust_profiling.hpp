@@ -116,17 +116,17 @@ public:
 		stats->is_forward_pass = is_forward_pass;
 		// extract unique probe table indices from probe columns
 		for (const auto &col : probe_columns) {
-			if (stats->probe_table_indices.empty() || stats->probe_table_indices.back() != col.table_index) {
+			if (stats->probe_table_indices.empty() || stats->probe_table_indices.back() != col.table_index.index) {
 				// check if already present
 				bool found = false;
 				for (auto idx : stats->probe_table_indices) {
-					if (idx == col.table_index) {
+					if (idx == col.table_index.index) {
 						found = true;
 						break;
 					}
 				}
 				if (!found) {
-					stats->probe_table_indices.push_back(col.table_index);
+					stats->probe_table_indices.push_back(col.table_index.index);
 				}
 			}
 		}

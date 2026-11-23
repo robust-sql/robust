@@ -30,7 +30,7 @@ InsertionOrderPreservingMap<string> LogicalCreateFilter::ParamsToString() const 
 	for (const auto &col : filter_operation.probe_columns) {
 		bool found = false;
 		for (auto idx : seen_probe) {
-			if (idx == col.table_index) {
+			if (idx == col.table_index.index) {
 				found = true;
 				break;
 			}
@@ -39,8 +39,8 @@ InsertionOrderPreservingMap<string> LogicalCreateFilter::ParamsToString() const 
 			if (!probe_tables.empty()) {
 				probe_tables += ", ";
 			}
-			probe_tables += to_string(col.table_index);
-			seen_probe.push_back(col.table_index);
+			probe_tables += to_string(col.table_index.index);
+			seen_probe.push_back(col.table_index.index);
 		}
 	}
 	result["Probe Tables"] = probe_tables;
@@ -50,7 +50,7 @@ InsertionOrderPreservingMap<string> LogicalCreateFilter::ParamsToString() const 
 		if (i > 0) {
 			build_cols += ", ";
 		}
-		build_cols += "(" + to_string(filter_operation.build_columns[i].table_index) + "." +
+		build_cols += "(" + to_string(filter_operation.build_columns[i].table_index.index) + "." +
 		              to_string(filter_operation.build_columns[i].column_index) + ")";
 	}
 	result["Build Columns"] = build_cols;

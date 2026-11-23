@@ -9,7 +9,7 @@
 
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
-#include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
 #include "../optimizer/graph_manager.hpp"
 
 namespace duckdb {
@@ -36,7 +36,7 @@ public:
 
 	struct DynamicFilterTarget {
 		shared_ptr<DynamicTableFilterSet> dynamic_filters;
-		idx_t scan_column_index;
+		ProjectionIndex scan_column_index;
 		ColumnBinding probe_column;
 		LogicalType column_type;
 		string column_name;

@@ -69,7 +69,7 @@ SET robust_flip_roots = ${flip_roots};
 
 # Positive: three-table chain join
 query II
-EXPLAIN SELECT count(*)
+EXPLAIN (FORMAT JSON) SELECT count(*)
 FROM t1, t2, t3
 WHERE t1.k12 = t2.k12
   AND t2.k23 = t3.k23;
@@ -77,7 +77,7 @@ WHERE t1.k12 = t2.k12
 physical_plan	<REGEX>:.*CREATE_FILTER.*
 
 query II
-EXPLAIN SELECT count(*)
+EXPLAIN (FORMAT JSON) SELECT count(*)
 FROM t1, t2, t3
 WHERE t1.k12 = t2.k12
   AND t2.k23 = t3.k23;
@@ -86,7 +86,7 @@ physical_plan	<REGEX>:.*PROBE_FILTER.*
 
 # Positive: four-table chain join
 query II
-EXPLAIN SELECT count(*)
+EXPLAIN (FORMAT JSON) SELECT count(*)
 FROM t1, t2, t3, t4
 WHERE t1.k12 = t2.k12
   AND t2.k23 = t3.k23
@@ -95,7 +95,7 @@ WHERE t1.k12 = t2.k12
 physical_plan	<REGEX>:.*CREATE_FILTER.*
 
 query II
-EXPLAIN SELECT count(*)
+EXPLAIN (FORMAT JSON) SELECT count(*)
 FROM t1, t2, t3, t4
 WHERE t1.k12 = t2.k12
   AND t2.k23 = t3.k23
@@ -105,7 +105,7 @@ physical_plan	<REGEX>:.*PROBE_FILTER.*
 
 # Positive: star join
 query II
-EXPLAIN SELECT count(*)
+EXPLAIN (FORMAT JSON) SELECT count(*)
 FROM t1, t2, t3, t4
 WHERE t1.k12 = t2.k12
   AND t2.k23 = t3.k23
@@ -114,7 +114,7 @@ WHERE t1.k12 = t2.k12
 physical_plan	<REGEX>:.*CREATE_FILTER.*
 
 query II
-EXPLAIN SELECT count(*)
+EXPLAIN (FORMAT JSON) SELECT count(*)
 FROM t1, t2, t3, t4
 WHERE t1.k12 = t2.k12
   AND t2.k23 = t3.k23

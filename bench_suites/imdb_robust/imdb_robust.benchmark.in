@@ -9,7 +9,6 @@ cache imdb.duckdb
 
 init
 LOAD 'build/release/extension/robust/robust.duckdb_extension';
-SET disabled_optimizers = 'join_filter_pushdown';
 SET robust_heuristic = 'join_order';
 
 run benchmark/imdb_plan_cost/queries/${QUERY_NUMBER_PADDED}.sql
