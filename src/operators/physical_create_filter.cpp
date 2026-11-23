@@ -26,11 +26,6 @@ PhysicalCreateFilter::PhysicalCreateFilter(PhysicalPlan &physical_plan,
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
       filter_operation(filter_operation), is_probing_side(false),
       bound_column_indices(std::move(bound_column_indices)) {
-	// create bloom filter for each build column, keyed by ColumnBinding
-	for (size_t i = 0; i < filter_operation->build_columns.size(); i++) {
-		const auto &col = filter_operation->build_columns[i];
-		bloom_filter_map[col] = make_shared_ptr<PTBloomFilter>();
-	}
 }
 
 string PhysicalCreateFilter::GetName() const {
@@ -90,6 +85,15 @@ InsertionOrderPreservingMap<string> PhysicalCreateFilter::ParamsToString() const
 //===--------------------------------------------------------------------===//
 
 template <typename T>
+static Value MinMaxValue(T value, bool) {
+	return Value::CreateValue(value);
+}
+
+static Value MinMaxValue(string_t value, bool raw) {
+	return raw ? Value::BLOB(const_data_ptr_cast(value.GetData()), value.GetSize()) : Value::CreateValue(value);
+}
+
+template <typename T>
 static void TypedUpdateMinMax(Vector &vec, ColumnMinMax &mm) {
 	T local_min {}, local_max {};
 	bool has_val = false;
@@ -117,8 +121,8 @@ static void TypedUpdateMinMax(Vector &vec, ColumnMinMax &mm) {
 		return;
 	}
 
-	Value vmin = Value::CreateValue(local_min);
-	Value vmax = Value::CreateValue(local_max);
+	Value vmin = MinMaxValue(local_min, mm.prf_only);
+	Value vmax = MinMaxValue(local_max, mm.prf_only);
 	if (!mm.has_value) {
 		mm.min_val = vmin;
 		mm.max_val = vmax;
@@ -133,50 +137,46 @@ static void TypedUpdateMinMax(Vector &vec, ColumnMinMax &mm) {
 	}
 }
 
-static void UpdateMinMax(Vector &vec, ColumnMinMax &mm) {
-	auto &type = vec.GetType();
+static void UpdateMinMax(Vector &vec, ColumnMinMax &mm, bool collect_prf_bounds) {
+	const auto &type = vec.GetType();
 	switch (type.id()) {
-	case LogicalTypeId::TINYINT:
-		TypedUpdateMinMax<int8_t>(vec, mm);
-		break;
-	case LogicalTypeId::SMALLINT:
-		TypedUpdateMinMax<int16_t>(vec, mm);
-		break;
-	case LogicalTypeId::INTEGER:
-		TypedUpdateMinMax<int32_t>(vec, mm);
-		break;
-	case LogicalTypeId::BIGINT:
-		TypedUpdateMinMax<int64_t>(vec, mm);
-		break;
-	case LogicalTypeId::UTINYINT:
-		TypedUpdateMinMax<uint8_t>(vec, mm);
-		break;
-	case LogicalTypeId::USMALLINT:
-		TypedUpdateMinMax<uint16_t>(vec, mm);
-		break;
-	case LogicalTypeId::UINTEGER:
-		TypedUpdateMinMax<uint32_t>(vec, mm);
-		break;
-	case LogicalTypeId::UBIGINT:
-		TypedUpdateMinMax<uint64_t>(vec, mm);
-		break;
-	case LogicalTypeId::FLOAT:
-		TypedUpdateMinMax<float>(vec, mm);
-		break;
-	case LogicalTypeId::DOUBLE:
-		TypedUpdateMinMax<double>(vec, mm);
-		break;
 	case LogicalTypeId::DATE:
-		TypedUpdateMinMax<date_t>(vec, mm);
-		break;
+		return TypedUpdateMinMax<date_t>(vec, mm);
 	case LogicalTypeId::TIMESTAMP:
-		TypedUpdateMinMax<timestamp_t>(vec, mm);
-		break;
-	case LogicalTypeId::VARCHAR:
-		TypedUpdateMinMax<string_t>(vec, mm);
-		break;
+		return TypedUpdateMinMax<timestamp_t>(vec, mm);
+	case LogicalTypeId::FLOAT:
+		return TypedUpdateMinMax<float>(vec, mm);
+	case LogicalTypeId::DOUBLE:
+		return TypedUpdateMinMax<double>(vec, mm);
 	default:
 		break;
+	}
+	// Bounds in the physical key representation cannot be pushed as SQL min/max comparisons.
+	mm.prf_only = !type.IsIntegral() && type.id() != LogicalTypeId::VARCHAR;
+	if (mm.prf_only && !collect_prf_bounds) {
+		return;
+	}
+	switch (type.InternalType()) {
+	case PhysicalType::INT8:
+		return TypedUpdateMinMax<int8_t>(vec, mm);
+	case PhysicalType::INT16:
+		return TypedUpdateMinMax<int16_t>(vec, mm);
+	case PhysicalType::INT32:
+		return TypedUpdateMinMax<int32_t>(vec, mm);
+	case PhysicalType::INT64:
+		return TypedUpdateMinMax<int64_t>(vec, mm);
+	case PhysicalType::UINT8:
+		return TypedUpdateMinMax<uint8_t>(vec, mm);
+	case PhysicalType::UINT16:
+		return TypedUpdateMinMax<uint16_t>(vec, mm);
+	case PhysicalType::UINT32:
+		return TypedUpdateMinMax<uint32_t>(vec, mm);
+	case PhysicalType::UINT64:
+		return TypedUpdateMinMax<uint64_t>(vec, mm);
+	case PhysicalType::VARCHAR:
+		return TypedUpdateMinMax<string_t>(vec, mm);
+	default:
+		return;
 	}
 }
 
@@ -194,6 +194,24 @@ CreateFilterGlobalSinkState::CreateFilterGlobalSinkState(ClientContext &context,
 			probe_empty_flag = reg->GetOrCreate(op.filter_operation->probe_table_idx);
 		}
 		Value v;
+		if (context.TryGetCurrentSetting("robust_filter_type", v)) {
+			scan_filter_type = v.GetValue<string>();
+		}
+		collect_prf_bounds.resize(op.bound_column_indices.size(), false);
+		for (const auto &target : op.pushdown_targets) {
+			target.dynamic_filters->ClearFilters(op);
+			if (scan_filter_type == "all" && target.max_prf_build_rows > 0 &&
+			    PrefixRangeFilter::SupportedType(target.column_type) &&
+			    (target.column_type.id() != LogicalTypeId::VARCHAR ||
+			     StringType::GetCollation(target.column_type).empty())) {
+				for (idx_t i = 0; i < collect_prf_bounds.size(); i++) {
+					if (op.filter_operation->build_columns[i] == target.build_column &&
+					    op.types[op.bound_column_indices[i]] == target.column_type) {
+						collect_prf_bounds[i] = true;
+					}
+				}
+			}
+		}
 		if (context.TryGetCurrentSetting("robust_dynamic_or_filter_threshold", v)) {
 			distinct_threshold = v.GetValue<uint64_t>();
 		}
@@ -246,7 +264,7 @@ SinkResultType PhysicalCreateFilter::Sink(ExecutionContext &context, DataChunk &
 				continue;
 			}
 			auto &vec = chunk.data[col_idx];
-			UpdateMinMax(vec, local_state.local_min_max[i]);
+			UpdateMinMax(vec, local_state.local_min_max[i], gstate.collect_prf_bounds[i]);
 		}
 	}
 
@@ -343,10 +361,98 @@ SinkCombineResultType PhysicalCreateFilter::Combine(ExecutionContext &context, O
 // Finalize
 //===--------------------------------------------------------------------===//
 
-// pushes dynamic filters (BF + min-max) to table scans after BF is fully built
-static void PushDynamicFilters(const PhysicalCreateFilter &op, const CreateFilterGlobalSinkState &gsink,
-                               ClientContext &context) {
-	if (!op.is_forward_pass || op.pushdown_targets.empty()) {
+static idx_t PrefixRangeBitBudget(const ColumnMinMax &bounds, idx_t rows) {
+	if (!bounds.has_value || bounds.min_val == bounds.max_val) {
+		return 0;
+	}
+	uhugeint_t span;
+	if (!PrefixRangeFilter::TryComputeSpan(bounds.min_val, bounds.max_val, span)) {
+		return 0;
+	}
+	static constexpr idx_t SMALL_EXACT_PRF_BITS = 1ULL << 26;
+	if (span < SMALL_EXACT_PRF_BITS) {
+		return SMALL_EXACT_PRF_BITS;
+	}
+	const auto bloom_bits = BloomFilter::GetNumberOfSectors(rows) * 64;
+	return span <= bloom_bits ? bloom_bits : 0;
+}
+
+void CreateFilterGlobalSinkState::PrepareFilters(ClientContext &context) {
+	const auto rows = total_data->Count();
+	push_prefix_range.resize(op.pushdown_targets.size(), false);
+	for (idx_t i = 0; i < op.bound_column_indices.size(); i++) {
+		const auto &binding = op.filter_operation->build_columns[i];
+		if (filters.count(binding)) {
+			continue;
+		}
+		auto &filter = filters[binding];
+		filter.stats_index = i;
+		filter.chunk_index = op.bound_column_indices[i];
+		bool needs_bloom = op.bloom_probe_columns.count(binding) > 0;
+		for (idx_t t = 0; t < op.pushdown_targets.size(); t++) {
+			const auto &target = op.pushdown_targets[t];
+			if (target.build_column != binding) {
+				continue;
+			}
+			idx_t bits = 0;
+			if (rows > 0 && rows <= target.max_prf_build_rows && collect_prf_bounds[i] && i < column_min_max.size() &&
+			    op.types[filter.chunk_index] == target.column_type) {
+				bits = PrefixRangeBitBudget(column_min_max[i], rows);
+			}
+			if (!bits) {
+				needs_bloom = true;
+				continue;
+			}
+			if (!filter.prefix_range) {
+				const auto &bounds = column_min_max[i];
+				filter.prefix_range = PrefixRangeFilter::CreatePrefixRangeFilter(target.column_type);
+				filter.prefix_range->Initialize(context, rows, bounds.min_val, bounds.max_val, bits);
+				filter.prefix_state = filter.prefix_range->InitializeBuildState(context);
+			}
+			push_prefix_range[t] = true;
+		}
+		if (needs_bloom || !filter.prefix_range) {
+			filter.bloom = make_shared_ptr<PTBloomFilter>();
+			if (rows > 0) {
+				filter.bloom->Initialize(context, rows);
+			}
+		}
+	}
+}
+
+void CreateFilterGlobalSinkState::InsertChunk(DataChunk &chunk, bool parallel) {
+	for (const auto &entry : filters) {
+		const auto &filter = entry.second;
+		if (filter.bloom) {
+			filter.bloom->Insert(chunk, {filter.chunk_index});
+		}
+		if (filter.prefix_range) {
+			auto &keys = chunk.data[filter.chunk_index];
+			if (parallel) {
+				filter.prefix_range->InsertKeysParallel(keys, *filter.prefix_state);
+			} else {
+				filter.prefix_range->InsertKeys(keys, *filter.prefix_state);
+			}
+		}
+	}
+}
+
+static unique_ptr<ExpressionFilter> CreatePrefixRangeScanFilter(PrefixRangeFilter &filter,
+                                                                const ScanFilterTarget &target) {
+	float threshold;
+	idx_t vectors;
+	GetThresholdAndVectorsToCheck(SelectivityOptionalFilterType::PRF, threshold, vectors);
+	vector<unique_ptr<Expression>> args;
+	args.push_back(make_uniq<BoundReferenceExpression>(target.column_type, 0ULL));
+	auto expr = make_uniq<BoundFunctionExpression>(
+	    BoundScalarFunction(PrefixRangeScalarFun::GetFunction(target.column_type)), std::move(args),
+	    make_uniq<PrefixRangeFunctionData>(&filter, true, target.column_name, target.column_type, threshold, vectors));
+	return make_uniq<ExpressionFilter>(
+	    CreateSelectivityOptionalFilterExpression(std::move(expr), target.column_type, threshold, vectors));
+}
+
+static void PushDynamicFilters(const PhysicalCreateFilter &op, const CreateFilterGlobalSinkState &gsink) {
+	if (op.pushdown_targets.empty()) {
 		return;
 	}
 
@@ -363,90 +469,76 @@ static void PushDynamicFilters(const PhysicalCreateFilter &op, const CreateFilte
 		return;
 	}
 
-	string filter_type = "all";
-	Value filter_type_val;
-	if (context.TryGetCurrentSetting("robust_filter_type", filter_type_val)) {
-		filter_type = filter_type_val.GetValue<string>();
-	}
+	const auto &filter_type = gsink.scan_filter_type;
+	const bool push_bf = filter_type == "all" || filter_type == "bf_only";
+	const bool push_minmax = filter_type == "all" || filter_type == "minmax_only";
 
-	bool push_bf = (filter_type == "all" || filter_type == "bf_only");
-	bool push_minmax = (filter_type == "all" || filter_type == "minmax_only");
-	bool consider_in = (filter_type == "all");
-
-	for (auto &target : op.pushdown_targets) {
-		for (size_t i = 0; i < op.filter_operation->build_columns.size(); i++) {
-			if (i >= op.filter_operation->probe_columns.size()) {
-				break;
+	for (idx_t t = 0; t < op.pushdown_targets.size(); t++) {
+		const auto &target = op.pushdown_targets[t];
+		auto it = gsink.filters.find(target.build_column);
+		if (it == gsink.filters.end()) {
+			continue;
+		}
+		const auto &filter = it->second;
+		const auto i = filter.stats_index;
+		if (filter_type == "all" && i < gsink.column_distinct.size()) {
+			const auto &cd = gsink.column_distinct[i];
+			Value single_value;
+			if (!cd.over_threshold && cd.values.size() == 1) {
+				single_value = *cd.values.begin();
+			} else if (gsink.collect_prf_bounds[i] && target.max_prf_build_rows &&
+			           op.types[filter.chunk_index] == target.column_type && i < gsink.column_min_max.size()) {
+				const auto &mm = gsink.column_min_max[i];
+				if (mm.has_value && mm.min_val == mm.max_val) {
+					Vector raw(mm.min_val, count_t(1));
+					Vector logical(target.column_type, 1);
+					logical.Reinterpret(raw);
+					single_value = logical.GetValue(0);
+				}
 			}
-			const auto &probe_col = op.filter_operation->probe_columns[i];
-			if (probe_col.table_index.index != target.probe_column.table_index.index ||
-			    probe_col.column_index != target.probe_column.column_index) {
+			if (!single_value.IsNull()) {
+				auto eq =
+				    ExpressionFilter::CreateComparisonFilter(ExpressionType::COMPARE_EQUAL, std::move(single_value));
+				target.dynamic_filters->PushFilter(op, target.scan_column_index, std::move(eq));
 				continue;
 			}
-
-			const auto &build_col = op.filter_operation->build_columns[i];
-
-			// push IN-filter (zonemap-only) or equality constant alongside BF; equality
-			// is per-row and supersedes BF/min-max
-			bool pushed_equal = false;
-			if (consider_in && i < gsink.column_distinct.size()) {
-				auto &cd = gsink.column_distinct[i];
-				if (!cd.over_threshold && cd.values.size() == 1) {
-					auto eq =
-					    ExpressionFilter::CreateComparisonFilter(ExpressionType::COMPARE_EQUAL, *cd.values.begin());
-					target.dynamic_filters->PushFilter(op, target.scan_column_index, std::move(eq));
-					pushed_equal = true;
-					D_PRINTF("[PUSHDOWN] pushed equality constant for col %s", target.column_name.c_str());
-				} else if (!cd.over_threshold && cd.values.size() > 1) {
-					vector<Value> in_list(cd.values.begin(), cd.values.end());
-					if (!FilterCombiner::ContainsNull(in_list) && !FilterCombiner::IsDenseRange(in_list)) {
-						auto in_expr = ExpressionFilter::CreateInExpression(
-						    make_uniq<BoundReferenceExpression>(target.column_type, 0ULL), std::move(in_list));
-						auto opt = make_uniq<ExpressionFilter>(
-						    CreateOptionalFilterExpression(std::move(in_expr), target.column_type));
-						target.dynamic_filters->PushFilter(op, target.scan_column_index, std::move(opt));
-						D_PRINTF("[PUSHDOWN] pushed IN-filter (%llu values) for col %s",
-						         (unsigned long long)cd.values.size(), target.column_name.c_str());
-					}
+			if (!cd.over_threshold && cd.values.size() > 1) {
+				vector<Value> values(cd.values.begin(), cd.values.end());
+				if (!FilterCombiner::ContainsNull(values) && !FilterCombiner::IsDenseRange(values)) {
+					auto in_expr = ExpressionFilter::CreateInExpression(
+					    make_uniq<BoundReferenceExpression>(target.column_type, 0ULL), std::move(values));
+					auto opt = make_uniq<ExpressionFilter>(
+					    CreateOptionalFilterExpression(std::move(in_expr), target.column_type));
+					target.dynamic_filters->PushFilter(op, target.scan_column_index, std::move(opt));
 				}
 			}
+		}
 
-			// keep BF alongside IN-filter for per-row pruning (IN is zonemap-only);
-			// equality filter already does per-row, skip BF there
-			if (push_bf && !pushed_equal) {
-				auto bf_it = op.bloom_filter_map.find(build_col);
-				if (bf_it != op.bloom_filter_map.end() && bf_it->second && !bf_it->second->IsEmpty()) {
-					vector<unique_ptr<Expression>> arguments;
-					arguments.push_back(make_uniq<BoundReferenceExpression>(target.column_type, 0ULL));
-					// Keep scan-side Bloom checks active by disabling selectivity tracking.
-					auto bf_expr = make_uniq<BoundFunctionExpression>(
-					    BoundScalarFunction(BloomFilterScalarFun::GetFunction(target.column_type)),
-					    std::move(arguments),
-					    make_uniq<BloomFilterFunctionData>(bf_it->second->GetNativeFilter(), false, target.column_name,
-					                                       target.column_type, 0.0f, idx_t(0)));
-					auto bf_filter = make_uniq<ExpressionFilter>(std::move(bf_expr));
-					target.dynamic_filters->PushFilter(op, target.scan_column_index, std::move(bf_filter));
-					D_PRINTF("[PUSHDOWN] pushed BF for col %s to scan col %llu", target.column_name.c_str(),
-					         (unsigned long long)target.scan_column_index);
-				}
+		if (gsink.push_prefix_range[t]) {
+			target.dynamic_filters->PushFilter(op, target.scan_column_index,
+			                                   CreatePrefixRangeScanFilter(*filter.prefix_range, target));
+			continue;
+		}
+		if (push_bf && filter.bloom && !filter.bloom->IsEmpty()) {
+			vector<unique_ptr<Expression>> args;
+			args.push_back(make_uniq<BoundReferenceExpression>(target.column_type, 0ULL));
+			auto bf_expr = make_uniq<BoundFunctionExpression>(
+			    BoundScalarFunction(BloomFilterScalarFun::GetFunction(target.column_type)), std::move(args),
+			    make_uniq<BloomFilterFunctionData>(filter.bloom->GetNativeFilter(), false, target.column_name,
+			                                       target.column_type, 0.0f, idx_t(0)));
+			target.dynamic_filters->PushFilter(op, target.scan_column_index,
+			                                   make_uniq<ExpressionFilter>(std::move(bf_expr)));
+		}
+		if (push_minmax && i < gsink.column_min_max.size()) {
+			const auto &mm = gsink.column_min_max[i];
+			if (mm.has_value && !mm.prf_only) {
+				target.dynamic_filters->PushFilter(
+				    op, target.scan_column_index,
+				    ExpressionFilter::CreateComparisonFilter(ExpressionType::COMPARE_GREATERTHANOREQUALTO, mm.min_val));
+				target.dynamic_filters->PushFilter(
+				    op, target.scan_column_index,
+				    ExpressionFilter::CreateComparisonFilter(ExpressionType::COMPARE_LESSTHANOREQUALTO, mm.max_val));
 			}
-
-			// equality filter already expresses min/max; skip min/max push in that case
-			if (push_minmax && !pushed_equal && i < gsink.column_min_max.size() && gsink.column_min_max[i].has_value) {
-				auto &mm = gsink.column_min_max[i];
-				auto min_filter =
-				    ExpressionFilter::CreateComparisonFilter(ExpressionType::COMPARE_GREATERTHANOREQUALTO, mm.min_val);
-				target.dynamic_filters->PushFilter(op, target.scan_column_index, std::move(min_filter));
-
-				auto max_filter =
-				    ExpressionFilter::CreateComparisonFilter(ExpressionType::COMPARE_LESSTHANOREQUALTO, mm.max_val);
-				target.dynamic_filters->PushFilter(op, target.scan_column_index, std::move(max_filter));
-
-				D_PRINTF("[PUSHDOWN] pushed min-max for col %s [%s, %s]", target.column_name.c_str(),
-				         mm.min_val.ToString().c_str(), mm.max_val.ToString().c_str());
-			}
-
-			break;
 		}
 	}
 }
@@ -455,12 +547,17 @@ static void PushDynamicFilters(const PhysicalCreateFilter &op, const CreateFilte
 // task-scheduling overhead; below this an inline single-threaded build is faster.
 static constexpr idx_t PARALLEL_BUILD_THRESHOLD = 102400; // ~100k rows (50 vectors)
 
-void PhysicalCreateFilter::PostBuildFinalize(const CreateFilterGlobalSinkState &gsink, ClientContext &context) const {
+void PhysicalCreateFilter::PostBuildFinalize(CreateFilterGlobalSinkState &gsink, ClientContext &context) const {
 	const idx_t actual_rows = gsink.total_data->Count();
 
-	for (auto &entry : bloom_filter_map) {
-		if (entry.second) {
-			entry.second->Seal(context);
+	for (auto &entry : gsink.filters) {
+		auto &filter = entry.second;
+		if (filter.prefix_range) {
+			filter.prefix_range->MergeBuildState(*filter.prefix_state);
+			filter.prefix_state.reset();
+		}
+		if (filter.bloom) {
+			filter.bloom->Seal(context);
 		}
 	}
 
@@ -470,18 +567,16 @@ void PhysicalCreateFilter::PostBuildFinalize(const CreateFilterGlobalSinkState &
 		gsink.probe_empty_flag->store(true, std::memory_order_relaxed);
 	}
 
-	PushDynamicFilters(*this, gsink, context);
+	PushDynamicFilters(*this, gsink);
 }
 
 namespace {
 
-// hashes + inserts a disjoint range of total_data chunks into the (already-allocated) BFs.
-// native BF inserts use atomic fetch_or, so concurrent inserts into the same filter are safe.
 class CreateFilterBuildTask : public ExecutorTask {
 public:
 	CreateFilterBuildTask(Pipeline &pipeline, shared_ptr<Event> event, const PhysicalCreateFilter &op,
 	                      CreateFilterGlobalSinkState &gsink, idx_t chunk_from, idx_t chunk_to)
-	    : ExecutorTask(pipeline.GetClientContext(), std::move(event), op), op(op), gsink(gsink), chunk_from(chunk_from),
+	    : ExecutorTask(pipeline.GetClientContext(), std::move(event), op), gsink(gsink), chunk_from(chunk_from),
 	      chunk_to(chunk_to) {
 	}
 
@@ -490,12 +585,7 @@ public:
 		gsink.total_data->InitializeScanChunk(chunk);
 		for (idx_t cid = chunk_from; cid < chunk_to; cid++) {
 			gsink.total_data->FetchChunk(cid, chunk);
-			for (size_t i = 0; i < op.filter_operation->build_columns.size(); i++) {
-				auto it = op.bloom_filter_map.find(op.filter_operation->build_columns[i]);
-				if (it != op.bloom_filter_map.end() && it->second) {
-					it->second->Insert(chunk, {op.bound_column_indices[i]});
-				}
-			}
+			gsink.InsertChunk(chunk, true);
 		}
 		event->FinishTask();
 		return TaskExecutionResult::TASK_FINISHED;
@@ -506,7 +596,6 @@ public:
 	}
 
 private:
-	const PhysicalCreateFilter &op;
 	CreateFilterGlobalSinkState &gsink;
 	idx_t chunk_from;
 	idx_t chunk_to;
@@ -574,39 +663,20 @@ SinkFinalizeType PhysicalCreateFilter::Finalize(Pipeline &pipeline, Event &event
 	}
 	gsink.local_data_collections.clear();
 
-	string build_table = filter_operation ? "table_" + std::to_string(filter_operation->build_table_idx) : "unknown";
-	D_PRINTF("[FINALIZE] CREATE_FILTER (build=%s): total_data contains %llu rows, %zu bloom filters",
-	         build_table.c_str(), (unsigned long long)gsink.total_data->Count(), bloom_filter_map.size());
-
-	// 2. build bloom filters from the materialized data, sized to the actual row count
-	const idx_t actual_rows = gsink.total_data->Count();
-
-	// large build side: allocate up front (sized to actual rows), then hash/insert in parallel via
-	// scheduled tasks; post-build steps run from the event's completion.
-	if (actual_rows >= PARALLEL_BUILD_THRESHOLD && gsink.total_data->ChunkCount() > 1) {
-		for (size_t i = 0; i < filter_operation->build_columns.size(); i++) {
-			auto it = bloom_filter_map.find(filter_operation->build_columns[i]);
-			if (it != bloom_filter_map.end() && it->second) {
-				it->second->Initialize(context, actual_rows);
-			}
-		}
-		fin_timer.reset(); // insert time is spent on the scheduled tasks, not this thread
+	gsink.PrepareFilters(context);
+	if (gsink.total_data->Count() >= PARALLEL_BUILD_THRESHOLD && gsink.total_data->ChunkCount() > 1) {
+		fin_timer.reset();
 		event.InsertEvent(make_shared_ptr<CreateFilterBuildEvent>(pipeline, *this, gsink));
 		return SinkFinalizeType::READY;
 	}
 
-	// small (or empty) build side: build inline on this thread
-	if (actual_rows > 0) {
-		for (size_t i = 0; i < filter_operation->build_columns.size(); i++) {
-			const auto &col = filter_operation->build_columns[i];
-			auto it = bloom_filter_map.find(col);
-			if (it == bloom_filter_map.end() || !it->second) {
-				continue;
-			}
-			it->second->ReinitializeAndRehash(context, actual_rows, *gsink.total_data, {bound_column_indices[i]});
-		}
+	DataChunk chunk;
+	gsink.total_data->InitializeScanChunk(chunk);
+	ColumnDataScanState scan;
+	gsink.total_data->InitializeScan(scan);
+	while (gsink.total_data->Scan(scan, chunk)) {
+		gsink.InsertChunk(chunk, false);
 	}
-
 	PostBuildFinalize(gsink, context);
 	return SinkFinalizeType::READY;
 }
@@ -620,9 +690,10 @@ unique_ptr<LocalSinkState> PhysicalCreateFilter::GetLocalSinkState(ExecutionCont
 }
 
 shared_ptr<PTBloomFilter> PhysicalCreateFilter::GetBloomFilter(const ColumnBinding &col) const {
-	auto it = bloom_filter_map.find(col);
-	if (it != bloom_filter_map.end()) {
-		return it->second;
+	const auto &filters = sink_state->Cast<CreateFilterGlobalSinkState>().filters;
+	auto it = filters.find(col);
+	if (it != filters.end()) {
+		return it->second.bloom;
 	}
 	return nullptr;
 }

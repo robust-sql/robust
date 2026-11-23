@@ -2,6 +2,8 @@
 
 #include "duckdb/execution/physical_operator.hpp"
 #include "bloom_filter.hpp"
+#include "scan_filter_target.hpp"
+#include "duckdb/planner/column_binding_map.hpp"
 #include "../optimizer/graph_manager.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include <duckdb/common/types/column/column_data_scan_states.hpp>
@@ -41,7 +43,7 @@ public:
 
 	// mark filters finalized, signal empty probe, push dynamic filters; runs inline for small
 	// builds or from the parallel build event's completion for large builds.
-	void PostBuildFinalize(const CreateFilterGlobalSinkState &gsink, ClientContext &context) const;
+	void PostBuildFinalize(CreateFilterGlobalSinkState &gsink, ClientContext &context) const;
 
 	bool IsSink() const override {
 		return true;
@@ -76,8 +78,7 @@ public:
 	// maps the column indices to resolved chunk column positions
 	vector<idx_t> bound_column_indices;
 
-	// column-keyed bloom filter map: ColumnBinding -> PTBloomFilter
-	unordered_map<ColumnBinding, shared_ptr<PTBloomFilter>, ColumnBindingHash, ColumnBindingEqual> bloom_filter_map;
+	column_binding_set_t bloom_probe_columns;
 
 	// pipeline reference
 	shared_ptr<Pipeline> this_pipeline;
@@ -86,14 +87,7 @@ public:
 	shared_ptr<PTBloomFilter> GetBloomFilter(const ColumnBinding &col) const;
 
 	// dynamic filter pushdown to table scans (forward pass only)
-	struct DynamicFilterTarget {
-		shared_ptr<DynamicTableFilterSet> dynamic_filters;
-		ProjectionIndex scan_column_index;
-		ColumnBinding probe_column;
-		LogicalType column_type;
-		string column_name;
-	};
-	vector<DynamicFilterTarget> pushdown_targets;
+	vector<ScanFilterTarget> pushdown_targets;
 	bool is_forward_pass = false;
 
 	// profiling
@@ -104,6 +98,7 @@ public:
 struct ColumnMinMax {
 	Value min_val, max_val;
 	bool has_value = false;
+	bool prf_only = false;
 };
 
 struct ColumnDistinct {
@@ -124,6 +119,20 @@ public:
 class CreateFilterGlobalSinkState : public GlobalSinkState {
 public:
 	CreateFilterGlobalSinkState(ClientContext &context, const PhysicalCreateFilter &op);
+	void PrepareFilters(ClientContext &context);
+	void InsertChunk(DataChunk &chunk, bool parallel);
+
+	struct ColumnFilter {
+		idx_t stats_index;
+		idx_t chunk_index;
+		shared_ptr<PTBloomFilter> bloom;
+		unique_ptr<PrefixRangeFilter> prefix_range;
+		unique_ptr<PrefixRangeFilter::BuildState> prefix_state;
+	};
+	column_binding_map_t<ColumnFilter> filters;
+	vector<bool> push_prefix_range;
+	string scan_filter_type = "all";
+	vector<bool> collect_prf_bounds;
 
 	const PhysicalCreateFilter &op;
 	mutex glock;

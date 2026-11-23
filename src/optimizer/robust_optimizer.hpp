@@ -30,6 +30,7 @@ struct PhysicalDAGEdge {
 	idx_t child_table;
 	vector<ColumnBinding> parent_cols;
 	vector<ColumnBinding> child_cols;
+	PRFProbeSides prf_probe_sides {false, false}; // parent, child
 };
 
 // node in physical plan DAG (supports multiple parents for multi-way joins)

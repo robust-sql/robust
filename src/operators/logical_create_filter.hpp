@@ -9,7 +9,7 @@
 
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
-#include "duckdb/planner/table_filter_set.hpp"
+#include "scan_filter_target.hpp"
 #include "../optimizer/graph_manager.hpp"
 
 namespace duckdb {
@@ -34,14 +34,7 @@ public:
 	vector<LogicalProbeFilter *> related_probe_filter;
 	bool is_forward_pass = false;
 
-	struct DynamicFilterTarget {
-		shared_ptr<DynamicTableFilterSet> dynamic_filters;
-		ProjectionIndex scan_column_index;
-		ColumnBinding probe_column;
-		LogicalType column_type;
-		string column_name;
-	};
-	vector<DynamicFilterTarget> pushdown_targets;
+	vector<ScanFilterTarget> pushdown_targets;
 
 	string message;
 

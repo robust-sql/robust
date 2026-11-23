@@ -106,20 +106,16 @@ PhysicalOperator &LogicalCreateFilter::CreatePlan(ClientContext &context, Physic
 		physical = static_cast<PhysicalCreateFilter *>(&physical_op);
 
 		// propagate dynamic filter pushdown targets
-		for (auto &target : pushdown_targets) {
-			PhysicalCreateFilter::DynamicFilterTarget phys_target;
-			phys_target.dynamic_filters = target.dynamic_filters;
-			phys_target.scan_column_index = target.scan_column_index;
-			phys_target.probe_column = target.probe_column;
-			phys_target.column_type = target.column_type;
-			phys_target.column_name = target.column_name;
-			physical->pushdown_targets.push_back(std::move(phys_target));
-		}
+		physical->pushdown_targets = pushdown_targets;
 		physical->is_forward_pass = is_forward_pass;
 
 		// link back to related PROBE_FILTER operators
 		// the links are used to create pipeline dependencies
 		for (const LogicalProbeFilter *probe_filter : related_probe_filter) {
+			if (!probe_filter->is_passthrough) {
+				auto &columns = probe_filter->filter_operation.build_columns;
+				physical->bloom_probe_columns.insert(columns.begin(), columns.end());
+			}
 			if (probe_filter->physical) {
 				// TODO: keep either related_create_filter or related_create_filter_vec. Not both. Most likely we'll
 				// have to remove related_create_filter.

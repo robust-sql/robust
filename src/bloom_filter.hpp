@@ -17,13 +17,11 @@
 
 namespace duckdb {
 
-class ColumnDataCollection;
-
 // wrapper around DuckDB's native BloomFilter with DataChunk-level operations
 class PTBloomFilter {
 public:
 	PTBloomFilter() = default;
-	void Initialize(ClientContext &context_p, uint32_t est_num_rows);
+	void Initialize(ClientContext &context_p, idx_t row_count);
 
 	ClientContext *context = nullptr;
 	BufferManager *buffer_manager = nullptr;
@@ -34,10 +32,6 @@ public:
 	idx_t LookupSel(DataChunk &chunk, SelectionVector &sel, const vector<idx_t> &bound_cols_applied,
 	                uint8_t *bit_vector_buf) const;
 	void Insert(DataChunk &chunk, const vector<idx_t> &bound_cols_built);
-
-	// reallocate the native BF for `actual_rows` and re-hash all rows from `data` on `cols`
-	void ReinitializeAndRehash(ClientContext &context_p, idx_t actual_rows, ColumnDataCollection &data,
-	                           const vector<idx_t> &cols);
 
 	idx_t SizedForRows() const {
 		return sized_for_rows_;
